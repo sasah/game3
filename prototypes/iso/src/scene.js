@@ -55,8 +55,9 @@ export const SPOTS = {
 // Path (screen guide only): gate to the hut door, gate down to the pond.
 export const PATH = [[-2.9, 0.7], [-1, 2.5], [1.5, 4.8], [3.5, 6], [3.6, 7.2], [2.8, 8.6]];
 
-// Hidden trail the candle reveals: wet footprints from the pond through the gate to the komora.
-export const TRAIL = [[2.6, 8.7], [3.4, 7.3], [3.5, 6.0], [3.9, 4.0], [4.2, 1.5], [4.3, -1.2], [4.24, -3.4]];
+// Hidden trail the candle reveals (as painted): wet footprints from the pond, through the gate,
+// up the path to the hut door.
+export const TRAIL = [[2.6, 8.7], [3.4, 7.3], [3.5, 6.0], [1.5, 4.8], [-1, 2.5], [-2.6, 1.0]];
 
 // Ground cells the walker may enter.
 export function isWalkable(x, z) {
