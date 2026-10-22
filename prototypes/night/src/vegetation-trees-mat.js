@@ -95,7 +95,7 @@ export function makeBarkMaterial(ctx, bark) {
   diffuseColor.rgb *= mix( barkTex.rgb, smoothBark, vBark.x );
 #endif`)
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n\tnormal = normalize( mix( normal, nonPerturbedNormal, vBark.x * 0.75 ) );')
-      .replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\n\tmaterial.roughness = mix( material.roughness, 0.55, vBark.x );\n\tmaterial.specularColor *= 0.6;');
+      .replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\n\tmaterial.roughness = mix( material.roughness, 0.72, vBark.x );\n\tmaterial.specularColor *= 0.6;');
   };
   mat.customProgramCacheKey = () => 'trees-bark';
   return { mat, depth: depthMaterial(ctx, 'bark') };
@@ -114,7 +114,7 @@ export function makeFoliageMaterial(ctx, atlas, { a2c }) {
   });
   mat.alphaToCoverage = !!a2c;
   const u = Object.assign(windUniforms(ctx), {
-    uTransCol: { value: new THREE.Color('#cfe3b0') },
+    uTransCol: { value: new THREE.Color('#a3b39b') },
     uGlowCol: { value: new THREE.Color().setRGB(0.05, 0.06, 0.08) },
     uMoonDirV: { value: new THREE.Vector3() },
   });
@@ -155,7 +155,7 @@ void RE_Direct_Tree( const in IncidentLight directLight, const in vec3 geometryP
   reflectedLight.directSpecular += dotNL * directLight.color * BRDF_GGX( directLight.direction, geometryViewDir, geometryNormal, material );
   // Moonlight through thin leaves and petals when looking toward the moon.
   float back = saturate( dot( - geometryViewDir, directLight.direction ) );
-  float tr = ( pow( back, 4.0 ) * 2.2 + 0.25 * saturate( - dot( geometryNormal, directLight.direction ) ) ) * vFol.x;
+  float tr = ( pow( back, 4.0 ) * 1.5 + 0.2 * saturate( - dot( geometryNormal, directLight.direction ) ) ) * vFol.x;
   reflectedLight.directDiffuse += directLight.color * material.diffuseColor * uTransCol * ( tr * RECIPROCAL_PI );
 }
 #undef RE_Direct

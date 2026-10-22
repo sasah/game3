@@ -6,41 +6,72 @@ import * as THREE from 'three';
 
 const TAU = Math.PI * 2;
 
+// willReadFrequently keeps the canvas on the CPU rasterizer: we read every texel back once, and a
+// GPU canvas would rasterize thousands of leaf paths and then stall on the readback.
 function makeCanvas(w, h) {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
+  c.getContext('2d', { willReadFrequently: true });
   return c;
 }
 
 const hsl = (h, s, l, a = 1) => `hsla(${h.toFixed(1)},${s.toFixed(1)}%,${l.toFixed(1)}%,${a})`;
 
-// Canvas (transparent background) -> sRGB DataTexture with colour bled into transparent texels.
+// Canvas (transparent background) -> sRGB DataTexture with colour bled into transparent texels, so
+// mip filtering never produces dark fringes. Bleeding uses an alpha-weighted mip pyramid in JS (fast,
+// unlike canvas blur filters on software canvases): a transparent texel takes the average colour of
+// the smallest enclosing block that contains any leaf.
 function toTexture(renderer, c, { mean = [60, 70, 50] } = {}) {
   const w = c.width, h = c.height;
   const src = c.getContext('2d').getImageData(0, 0, w, h).data;
-  const blur = (px) => {
-    const b = makeCanvas(w, h);
-    const g = b.getContext('2d');
-    g.filter = `blur(${px}px)`;
-    g.drawImage(c, 0, 0);
-    if (px > 8) g.drawImage(b, 0, 0); // thicken the wide halo
-    return g.getImageData(0, 0, w, h).data;
-  };
-  const near = blur(Math.max(2, Math.round(w / 512) * 2));
-  const far = blur(Math.max(8, Math.round(w / 64)));
-  const out = new Uint8Array(w * h * 4);
-  for (let i = 0; i < out.length; i += 4) {
-    const a = src[i + 3];
-    out[i + 3] = a;
-    if (a > 252) { out[i] = src[i]; out[i + 1] = src[i + 1]; out[i + 2] = src[i + 2]; continue; }
-    let r, gg, b;
-    if (near[i + 3] > 6) { r = near[i]; gg = near[i + 1]; b = near[i + 2]; }
-    else if (far[i + 3] > 1) { r = far[i]; gg = far[i + 1]; b = far[i + 2]; }
-    else { r = mean[0]; gg = mean[1]; b = mean[2]; }
-    const k = a / 255;
-    out[i] = src[i] * k + r * (1 - k);
-    out[i + 1] = src[i + 1] * k + gg * (1 - k);
-    out[i + 2] = src[i + 2] * k + b * (1 - k);
+  const out = new Uint8Array(src.buffer.slice(0));
+  const levels = [];
+  let lw = w >> 1, lh = h >> 1;
+  // level 1 from the bytes
+  {
+    const cs = new Float32Array(lw * lh * 4);
+    for (let y = 0; y < lh; y++) {
+      for (let x = 0; x < lw; x++) {
+        let r = 0, g = 0, b = 0, a = 0;
+        for (let k = 0; k < 4; k++) {
+          const i = (((y * 2 + (k >> 1)) * w) + x * 2 + (k & 1)) * 4;
+          const wa = src[i + 3];
+          r += src[i] * wa; g += src[i + 1] * wa; b += src[i + 2] * wa; a += wa;
+        }
+        const j = (y * lw + x) * 4;
+        cs[j] = r; cs[j + 1] = g; cs[j + 2] = b; cs[j + 3] = a;
+      }
+    }
+    levels.push({ w: lw, h: lh, cs });
+  }
+  while (lw > 1 && lh > 1) {
+    const pw = lw, prev = levels[levels.length - 1].cs;
+    lw >>= 1; lh >>= 1;
+    const cs = new Float32Array(lw * lh * 4);
+    for (let y = 0; y < lh; y++) {
+      for (let x = 0; x < lw; x++) {
+        const j = (y * lw + x) * 4;
+        for (let k = 0; k < 4; k++) {
+          const i = (((y * 2 + (k >> 1)) * pw) + x * 2 + (k & 1)) * 4;
+          cs[j] += prev[i]; cs[j + 1] += prev[i + 1]; cs[j + 2] += prev[i + 2]; cs[j + 3] += prev[i + 3];
+        }
+      }
+    }
+    levels.push({ w: lw, h: lh, cs });
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (src[i + 3] > 0) continue;
+      let r = mean[0], g = mean[1], b = mean[2];
+      for (let l = 0; l < levels.length; l++) {
+        const L = levels[l];
+        const j = (((y >> (l + 1)) * L.w) + (x >> (l + 1))) * 4;
+        const a = L.cs[j + 3];
+        if (a > 0) { r = L.cs[j] / a; g = L.cs[j + 1] / a; b = L.cs[j + 2] / a; break; }
+      }
+      out[i] = r; out[i + 1] = g; out[i + 2] = b;
+    }
   }
   const tex = new THREE.DataTexture(out, w, h, THREE.RGBAFormat, THREE.UnsignedByteType);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -134,13 +165,13 @@ function leafFits(r, x, y, ang, len) {
 // Willow spray (Salix alba): twigs fanning up from the bottom centre, narrow grey-green leaves with
 // silvery undersides. `upright` narrows the fan (pollard shoots).
 function paintWillowSpray(g, r, s, rng, upright) {
-  const twigs = 5 + Math.floor(rng() * 3);
+  const twigs = 8 + Math.floor(rng() * 3);
   const leaves = [];
   for (let k = 0; k < twigs; k++) {
-    const bx = r.x + r.w * (0.5 + (rng() - 0.5) * 0.12), by = r.y + r.h * 0.985;
-    const spread = upright ? 0.75 : 1.5;
+    const bx = r.x + r.w * (0.5 + (rng() - 0.5) * 0.3), by = r.y + r.h * (0.985 - rng() * 0.12);
+    const spread = upright ? 1.3 : 2.3;
     const a0 = -Math.PI / 2 + ((k + 0.5) / twigs - 0.5) * spread + (rng() - 0.5) * 0.25;
-    const len = r.h * (0.6 + rng() * 0.33);
+    const len = r.h * (0.5 + rng() * 0.4) * (1 - 0.25 * Math.abs(a0 + Math.PI / 2));
     const pts = twigPath(rng, bx, by, a0, len, (rng() - 0.5) * 0.8, 0.12);
     strokeTwig(g, pts, 3.0 * s, 0.7 * s, hsl(35, 18, 22));
     const n = Math.floor(len / (7.5 * s));
@@ -198,11 +229,11 @@ function paintStrand(g, r, s, rng) {
 
 // Lombardy poplar spray: narrow fan of twigs crowded with small deltoid leaves on petioles.
 function paintPoplarSpray(g, r, s, rng) {
-  const twigs = 6 + Math.floor(rng() * 3);
+  const twigs = 8 + Math.floor(rng() * 3);
   const leaves = [];
   for (let k = 0; k < twigs; k++) {
-    const bx = r.x + r.w * (0.5 + (rng() - 0.5) * 0.2), by = r.y + r.h * 0.985;
-    const a0 = -Math.PI / 2 + ((k + 0.5) / twigs - 0.5) * 1.1 + (rng() - 0.5) * 0.2;
+    const bx = r.x + r.w * (0.5 + (rng() - 0.5) * 0.3), by = r.y + r.h * (0.985 - rng() * 0.1);
+    const a0 = -Math.PI / 2 + ((k + 0.5) / twigs - 0.5) * 1.9 + (rng() - 0.5) * 0.2;
     const len = r.h * (0.55 + rng() * 0.4);
     const pts = twigPath(rng, bx, by, a0, len, (rng() - 0.5) * 0.4, 0.1);
     strokeTwig(g, pts, 2.6 * s, 0.7 * s, hsl(30, 12, 24));
@@ -262,42 +293,49 @@ function flower(g, x, y, rad, rng, rot, squash) {
   g.restore();
 }
 
-// Cherry spray in full blossom: dark twigs, umbels of 2-5 flowers on pedicels, buds and a few
-// young leaves (more leaves when `leafy`).
+// Cherry blossom cluster: a rounded cloud of umbels (2-5 flowers on pedicels) on short spurs, fed
+// by a few dark twigs from the bottom; buds and young leaves (more leaves when `leafy`). Rounded
+// rather than fan-shaped so a crown of these reads as soft masses, not spikes.
 function paintBlossom(g, r, s, rng, leafy) {
-  const twigs = 3 + Math.floor(rng() * 3);
+  const cx = r.x + r.w * 0.5, cy = r.y + r.h * 0.5;
+  const rx = r.w * 0.39, ry = r.h * 0.36;
   const items = [];
-  for (let k = 0; k < twigs; k++) {
-    const bx = r.x + r.w * (0.5 + (rng() - 0.5) * 0.2), by = r.y + r.h * 0.985;
-    const a0 = -Math.PI / 2 + ((k + 0.5) / twigs - 0.5) * 1.6 + (rng() - 0.5) * 0.3;
-    const len = r.h * (0.5 + rng() * 0.42);
-    const pts = twigPath(rng, bx, by, a0, len, (rng() - 0.5) * 0.9, 0.22, 10);
-    strokeTwig(g, pts, 4.2 * s, 1.4 * s, hsl(12, 22, 15));
-    const n = Math.floor(len / (24 * s));
-    for (let i = 1; i <= n; i++) {
-      const t = Math.min(1, i / n + (rng() - 0.5) * 0.08);
-      const [x, y, a] = along(pts, t);
-      // young leaves at the spur
-      const nl = leafy ? 2 + Math.floor(rng() * 2) : (rng() < 0.45 ? 1 : 0);
-      for (let q = 0; q < nl; q++) {
-        const la = a + (rng() < 0.5 ? -1 : 1) * (0.5 + rng() * 0.9);
-        const ll = (leafy ? 38 + rng() * 22 : 22 + rng() * 14) * s;
-        if (leafFits(r, x, y, la, ll)) items.push({ type: 'leaf', x, y, a: la, l: ll, w: ll * 0.3 });
-      }
-      const nf = 2 + Math.floor(rng() * 4);
-      for (let f = 0; f < nf; f++) {
-        const pa = a + (rng() - 0.5) * 2.6;
-        const pl = (8 + rng() * 14) * s;
-        const fx = x + Math.cos(pa) * pl, fy = y + Math.sin(pa) * pl;
-        const rad = (10 + rng() * 4.5) * s;
-        if (!inside(fx - rad, fy - rad, r) || !inside(fx + rad, fy + rad, r)) continue;
-        items.push({ type: 'ped', x, y, fx, fy });
-        if (rng() < 0.12) items.push({ type: 'bud', x: fx, y: fy, rad: rad * 0.42 });
-        else items.push({ type: 'fl', x: fx, y: fy, rad, rot: rng() * TAU, sq: 0.55 + rng() * 0.45, z: rng() });
-      }
+  const spurs = [];
+  const nTw = 4 + Math.floor(rng() * 3);
+  for (let k = 0; k < nTw; k++) {
+    const bx = cx + (rng() - 0.5) * r.w * 0.12, by = r.y + r.h * 0.985;
+    const a = rng() * TAU, d = 0.35 + rng() * 0.65;
+    const tx = cx + Math.cos(a) * rx * d, ty = cy + Math.sin(a) * ry * d - ry * 0.15;
+    const ang = Math.atan2(ty - by, tx - bx);
+    const len = Math.hypot(tx - bx, ty - by);
+    const pts = twigPath(rng, bx, by, ang, len, (rng() - 0.5) * 0.6, 0.18, 10);
+    strokeTwig(g, pts, 4.0 * s, 1.3 * s, hsl(12, 20, 14));
+    for (let t = 0.4 + rng() * 0.1; t <= 1.0; t += 0.16) spurs.push(along(pts, t));
+  }
+  const nExtra = 30 + Math.floor(rng() * 8);
+  for (let i = 0; i < nExtra; i++) {
+    const a = rng() * TAU, d = Math.sqrt(rng()) * 0.92;
+    spurs.push([cx + Math.cos(a) * rx * d, cy + Math.sin(a) * ry * d, -Math.PI / 2 + (rng() - 0.5) * 2]);
+  }
+  for (const [x, y, a] of spurs) {
+    const nl = leafy ? 1 + Math.floor(rng() * 2.5) : (rng() < 0.25 ? 1 : 0);
+    for (let q = 0; q < nl; q++) {
+      const la = a + (rng() < 0.5 ? -1 : 1) * (0.4 + rng() * 1.2);
+      const ll = (leafy ? 34 + rng() * 20 : 22 + rng() * 12) * s;
+      if (leafFits(r, x, y, la, ll)) items.push({ type: 'leaf', x, y, a: la, l: ll, w: ll * 0.3 });
+    }
+    const nf = 2 + Math.floor(rng() * 4);
+    for (let f = 0; f < nf; f++) {
+      const pa = rng() * TAU;
+      const pl = (6 + rng() * 12) * s;
+      const fx = x + Math.cos(pa) * pl, fy = y + Math.sin(pa) * pl;
+      const rad = (10 + rng() * 4) * s;
+      if (!inside(fx - rad, fy - rad, r) || !inside(fx + rad, fy + rad, r)) continue;
+      items.push({ type: 'ped', x, y, fx, fy });
+      if (rng() < 0.1) items.push({ type: 'bud', x: fx, y: fy, rad: rad * 0.42 });
+      else items.push({ type: 'fl', x: fx, y: fy, rad, rot: rng() * TAU, sq: 0.55 + rng() * 0.45, z: rng() });
     }
   }
-  // pedicels, then leaves, then flowers back to front
   g.lineWidth = 1.1 * s;
   for (const it of items) if (it.type === 'ped') { g.strokeStyle = hsl(80, 30, 34); g.beginPath(); g.moveTo(it.x, it.y); g.lineTo(it.fx, it.fy); g.stroke(); }
   for (const it of items) if (it.type === 'leaf') {
@@ -308,6 +346,38 @@ function paintBlossom(g, r, s, rng, leafy) {
   for (const it of fl) {
     if (it.type === 'bud') { g.fillStyle = hsl(345, 25, 86); g.beginPath(); g.arc(it.x, it.y, it.rad, 0, TAU); g.fill(); }
     else flower(g, it.x, it.y, it.rad, rng, it.rot, it.sq);
+  }
+}
+
+// Upright willow wands (fresh shoots of a pollard): 3-5 nearly parallel shoots from the bottom with
+// narrow leaves all along them, angled up and out.
+function paintWands(g, r, s, rng) {
+  const n = 3 + Math.floor(rng() * 3);
+  const leaves = [];
+  for (let k = 0; k < n; k++) {
+    const bx = r.x + r.w * (0.2 + 0.6 * (k + 0.5) / n + (rng() - 0.5) * 0.08), by = r.y + r.h * 0.99;
+    const a0 = -Math.PI / 2 + (bx - (r.x + r.w / 2)) / r.w * 0.5 + (rng() - 0.5) * 0.12;
+    const len = r.h * (0.72 + rng() * 0.26);
+    const pts = twigPath(rng, bx, by, a0, len, (rng() - 0.5) * 0.15, 0.04, 24);
+    strokeTwig(g, pts, 2.6 * s, 0.7 * s, hsl(38, 20, 24));
+    const m = Math.floor(len / (6 * s));
+    for (let i = 3; i < m; i++) {
+      const t = i / m;
+      const [x, y, a] = along(pts, t);
+      const side = i % 2 ? 1 : -1;
+      const la = a + side * (0.3 + rng() * 0.45);
+      const ll = (30 + rng() * 16) * s * (1 - 0.45 * t * t);
+      if (!leafFits(r, x, y, la, ll)) continue;
+      leaves.push([x, y, la, ll, ll * (0.11 + rng() * 0.05)]);
+    }
+  }
+  for (let i = leaves.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [leaves[i], leaves[j]] = [leaves[j], leaves[i]]; }
+  for (const [x, y, a, l, w] of leaves) {
+    const silver = rng() < 0.42;
+    const L = silver ? 52 + rng() * 14 : 28 + rng() * 13;
+    const S = silver ? 7 + rng() * 6 : 14 + rng() * 10;
+    const H = silver ? 105 + rng() * 25 : 78 + rng() * 18;
+    leaf(g, x, y, a, l, w, hsl(H, S, L), hsl(H, S, L * 0.8), null, 'lance');
   }
 }
 
@@ -372,6 +442,7 @@ const LAYOUT = {
   cherryA: [0, 1, 1, 1], cherryB: [1, 1, 1, 1], bushA: [2, 1, 1, 1], bushB: [3, 1, 1, 1],
   strandA: [0, 2, 0.375, 2], strandB: [0.375, 2, 0.375, 2], strandC: [0.75, 2, 0.375, 2], strandD: [1.125, 2, 0.375, 2],
   cherryC: [1.5, 2, 1, 1], willowC: [2.5, 2, 1, 1], poplarC: [1.5, 3, 1, 1], cherryD: [2.5, 3, 1, 1],
+  wandA: [3.5, 2, 0.5, 1], wandB: [3.5, 3, 0.5, 1],
 };
 
 export function buildFoliageAtlas(renderer, rng, quality) {
@@ -390,6 +461,7 @@ export function buildFoliageAtlas(renderer, rng, quality) {
     else if (name.startsWith('strand')) paintStrand(g, r, s, rng);
     else if (name.startsWith('poplar')) paintPoplarSpray(g, r, s, rng);
     else if (name.startsWith('cherry')) paintBlossom(g, r, s, rng, name === 'cherryB' || name === 'cherryD');
+    else if (name.startsWith('wand')) paintWands(g, r, s, rng);
     else if (name === 'bushA') paintBushSpray(g, r, s, rng, false);
     else if (name === 'bushB') paintBushSpray(g, r, s, rng, true);
   }
