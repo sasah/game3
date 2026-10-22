@@ -60,6 +60,35 @@ def generate(model, prompt, size, quality, transparent):
     return base64.b64decode(res['data'][0]['b64_json']), res.get('usage')
 
 
+def edit(model, prompt, src_path, size, quality, transparent):
+    """Rework an existing image (reference-guided). Used for cut-outs and new expressions."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.open(src_path).convert('RGBA').save(buf, 'PNG')
+    fields = {'model': model, 'prompt': prompt, 'size': size, 'quality': quality, 'n': '1'}
+    if transparent:
+        fields['background'] = 'transparent'
+        fields['output_format'] = 'png'
+    boundary = '----gen-image-' + os.urandom(8).hex()
+    parts = []
+    for k, v in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="src.png"\r\n'
+                 f'Content-Type: image/png\r\n\r\n'.encode() + buf.getvalue() + b'\r\n')
+    parts.append(f'--{boundary}--\r\n'.encode())
+    headers = {'Content-Type': 'multipart/form-data; boundary=' + boundary}
+    key = os.environ.get('OPENAI_API_KEY')
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    req = urllib.request.Request(API + '/images/edits', data=b''.join(parts), headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'{e.code} {e.read().decode(errors="replace")[:800]}') from None
+    return base64.b64decode(res['data'][0]['b64_json']), res.get('usage')
+
+
 def save(png, path):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     if path.endswith('.webp'):
@@ -83,12 +112,28 @@ def main():
     ap.add_argument('--model')
     ap.add_argument('--only', help='comma-separated ids from the batch')
     ap.add_argument('--skip-existing', action='store_true')
+    ap.add_argument('--edit', help='source image to rework with --prompt (writes --out-file)')
     a = ap.parse_args()
 
     model = a.model
     if not model:
         model, ids = pick_model()
         print(f'models available: {", ".join(ids)}\nusing: {model}')
+
+    if a.edit:
+        out = a.out_file or a.edit
+        t0 = time.time()
+        print(f'edit {a.edit} -> {out} {a.size}{" transparent" if a.transparent else ""} ...', flush=True)
+        png, usage = edit(model, a.prompt, a.edit, a.size, a.quality, a.transparent)
+        save(png, out)
+        dt = time.time() - t0
+        print(f'  ok {out} {os.path.getsize(out) // 1024} KB {dt:.0f}s usage={usage}')
+        logdir = os.path.dirname(out) or '.'
+        with open(os.path.join(logdir, 'log.jsonl'), 'a') as log:
+            log.write(json.dumps({'id': os.path.splitext(os.path.basename(out))[0], 'model': model, 'mode': 'edit',
+                                  'source': a.edit, 'quality': a.quality, 'size': a.size, 'seconds': round(dt),
+                                  'usage': usage, 'prompt': a.prompt}, ensure_ascii=False) + '\n')
+        return
 
     jobs = []
     if a.batch:
