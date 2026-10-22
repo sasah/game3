@@ -107,4 +107,9 @@ export function scheduleRings(ctx, ground, ringUniforms) {
   });
   // Shots start at t≈0: show one ring already spreading.
   if (ctx.params.has('shot')) spawn(slots[0], Number(ctx.params.get('t') || 0) - 1.6);
+  if (ctx.params.has('wring')) {
+    const [x, z] = ctx.params.get('wring').split(',').map(Number);
+    slots[1].v.set(x, z, Number(ctx.params.get('t') || 0) - 1.2, 1);
+    slots[1].next = 1e9;
+  }
 }
