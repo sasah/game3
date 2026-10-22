@@ -78,7 +78,7 @@ void RE_Direct_Veg( const in IncidentLight directLight, const in vec3 geometryPo
   RE_Direct_Physical( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
   float back = saturate( dot( -geometryViewDir, directLight.direction ) );
   float through = saturate( -dot( geometryNormal, directLight.direction ) );
-  float tr = ( pow( back, 4.0 ) * 1.6 + through * 0.45 ) * vVegTrans;
+  float tr = ( pow( back, 2.5 ) * 4.0 + through * 1.6 ) * vVegTrans;
   reflectedLight.directDiffuse += directLight.color * material.diffuseColor * uTransCol * ( tr * RECIPROCAL_PI );
 }
 #undef RE_Direct
@@ -86,10 +86,11 @@ void RE_Direct_Veg( const in IncidentLight directLight, const in vec3 geometryPo
 `;
 
 // Blend shading normals toward the sky (soft, volumetric look of foliage), after the face flip.
+// vVegUp (per vertex) lets arching blade tips face the sky more than their stiff bases.
 export const GLSL_NORMAL_SOFTEN = /* glsl */ `
 #include <normal_fragment_begin>
 {
   vec3 vegUp = normalize( ( viewMatrix * vec4( 0.0, 1.0, 0.0, 0.0 ) ).xyz );
-  normal = normalize( mix( normal, vegUp, VEG_SOFTEN ) );
+  normal = normalize( mix( normal, vegUp, VEG_SOFTEN + vVegUp ) );
 }
 `;

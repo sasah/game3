@@ -43,23 +43,25 @@ const fragmentShader = /* glsl */ `
     // Wisps stretched downwind, slowly evolving; a broad layer keeps whole banks of it coming and going.
     float n1 = texture2D( tNoise, q * vec2( 0.021, 0.065 ) + vec2( vLayer * 0.37, vLayer * 0.71 ) ).r;
     float n2 = texture2D( tNoise, q * vec2( 0.07, 0.15 ) + vec2( 0.5 + uTime * 0.004, vLayer * 0.53 ) ).g;
-    float n3 = texture2D( tNoise, p * 0.017 + vec2( uDrift.y * 0.0015, 0.3 * vLayer ) ).b;
+    float n3 = texture2D( tNoise, q * 0.036 + vec2( uDrift.y * 0.0012, 0.3 * vLayer ) ).b;
     float n = n1 * 0.5 + n2 * 0.3 + n3 * 0.3;
     float dens = gm.g * soft * smoothstep( 0.48, 0.82, n );
 
     vec3 ray = vWorld - cameraPosition;
     float dist = length( ray );
     vec3 rd = ray / dist;
-    float sinA = max( abs( rd.y ), 0.06 );
+    float sinA = max( abs( rd.y ), 0.09 );
     float tau = dens * uDensity / sinA;
     float a = 1.0 - exp( - tau );
     a *= smoothstep( 1.5, 8.0, dist );
-    a = min( a, 0.45 );
+    a = min( a, 0.38 );
 
     float mu = max( dot( rd, uMoonDir ), 0.0 );
     vec3 col = uMistColor * ( 0.7 + 0.5 * mu * mu + 2.4 * pow( mu, 10.0 ) );
     gl_FragColor = vec4( col, a );
     #include <fog_fragment>
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
   }`;
 
 export function buildMist(ctx, ground, noise) {
@@ -114,7 +116,7 @@ export function buildMist(ctx, ground, noise) {
     uWindDir: ctx.uniforms.uWindDir,
     uMoonDir: { value: world.MOON_DIR.clone().normalize() },
     uMistColor: { value: new THREE.Color().setRGB(0.1, 0.128, 0.148) },
-    uDensity: { value: quality === 'high' ? 0.042 : 0.075 },
+    uDensity: { value: quality === 'high' ? 0.045 : 0.06 },
   });
   const mat = new THREE.ShaderMaterial({
     name: 'PondMist',

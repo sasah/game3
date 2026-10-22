@@ -30,6 +30,28 @@ export async function build(ctx) {
   for (const m of patches) tris += m.userData.instances * m.userData.trisPerInstance;
   const reedTris = reeds ? reeds.geometry.index.count / 3 : 0;
   console.log(`[grass] fields ${(t1 - t0).toFixed(0)} ms, meshes ${(t2 - t1).toFixed(0)} ms; patch tris ${tris}, reed tris ${reedTris} (${patches.map((m) => m.name + ':' + m.userData.instances).join(' ')})`);
+  if (ctx.params.has('vegtexdebug')) {
+    // Show the painted atlases on screen (debug only).
+    const imgs = [patches[2].material.userData.tex, reeds && reeds.material.userData.tex].filter(Boolean);
+    imgs.forEach((t, i) => {
+      const cv = t.image;
+      cv.style.cssText = `position:fixed;left:${8 + i * 520}px;top:8px;width:512px;height:512px;z-index:99;background:#556;`;
+      document.body.appendChild(cv);
+    });
+  }
+  if (ctx.params.has('terrainmatte')) {
+    // Debug experiment only (not used in normal runs): what the meadow looks like on a matte ground.
+    const t = ctx.scene.getObjectByName('terrain');
+    if (t) {
+      t.material.onBeforeCompile = (sh) => {
+        sh.fragmentShader = sh.fragmentShader.replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\nmaterial.specularColor *= 0.2; material.specularF90 = 0.2;');
+      };
+      t.material.customProgramCacheKey = () => 'terrain-matte-test';
+      t.material.needsUpdate = true;
+    }
+  }
+  if (ctx.params.has('nopatches')) for (const m of patches) m.visible = false;
+  if (ctx.params.has('noreeds') && reeds) reeds.visible = false;
   if (ctx.params.has('nograss')) {
     for (const m of patches) m.visible = false;
     if (reeds) reeds.visible = false;

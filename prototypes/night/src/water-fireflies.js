@@ -9,6 +9,7 @@ const vertexShader = /* glsl */ `
   uniform float uTime;
   uniform float uViewH;
   varying float vI;
+  varying float vSize;
   void main() {
     float ph = aSeed.x * 6.2831853;
     float t = uTime * aSeed.y;
@@ -28,6 +29,7 @@ const vertexShader = /* glsl */ `
     float s = clamp( px, 3.5, 48.0 );
     vI = glow * min( 1.0, ( px * px ) / ( s * s ) );
     gl_PointSize = s;
+    vSize = s;
     #include <fog_vertex>
   }`;
 
@@ -35,13 +37,16 @@ const fragmentShader = /* glsl */ `
   #include <fog_pars_fragment>
   uniform vec3 uColor;
   varying float vI;
+  varying float vSize;
   void main() {
     vec2 d = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot( d, d );
     if ( r2 > 1.0 ) discard;
-    float core = exp( - r2 * 22.0 );
-    float halo = exp( - r2 * 4.0 ) * ( 1.0 - r2 );
-    vec3 col = uColor * ( core * 12.0 + halo * 0.6 ) * vI;
+    // A tiny hot core (about 2 px whatever the distance) inside a soft world-sized glow.
+    float pr2 = r2 * vSize * vSize * 0.25;
+    float core = exp( - pr2 / 2.2 );
+    float halo = exp( - r2 * 4.5 ) * ( 1.0 - r2 );
+    vec3 col = uColor * ( core * 4.0 + halo * 0.5 ) * vI;
     // Additive: fog should only dim the glow, never add its own color.
     gl_FragColor = vec4( 0.0, 0.0, 0.0, 1.0 );
     {
@@ -51,6 +56,8 @@ const fragmentShader = /* glsl */ `
     gl_FragColor = vec4( col, 1.0 );
     #include <fog_fragment>
     gl_FragColor.rgb = max( gl_FragColor.rgb - fogAdd, 0.0 );
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
   }`;
 
 export function buildFireflies(ctx) {
@@ -65,6 +72,9 @@ export function buildFireflies(ctx) {
     const b = L.bounds;
     if (Math.hypot(x - b.cx, z - b.cz) > b.r + 4) return false;
     if (Math.abs(x - pier.x) < 1.2 && z < pier.z0 + 1 && z > pier.z1 - 1) return false;
+    // Not inside the hut.
+    const H = L.hut, dx = x - H.x, dz = z - H.z, c = Math.cos(H.rotY), s = Math.sin(H.rotY);
+    if (Math.abs(dx * c - dz * s) < H.width / 2 + 1 && Math.abs(dx * s + dz * c) < H.depth / 2 + 1) return false;
     return world.heightAt(x, z) > 0.12;
   };
   let n = 0, guard = 0;
@@ -103,7 +113,7 @@ export function buildFireflies(ctx) {
     seed[n * 4] = rnd();
     seed[n * 4 + 1] = 0.25 + rnd() * 0.45;
     seed[n * 4 + 2] = 2.2 + rnd() * 4.5;
-    seed[n * 4 + 3] = 0.07 + rnd() * 0.05;
+    seed[n * 4 + 3] = 0.1 + rnd() * 0.06;
     n++;
   }
   const geo = new THREE.BufferGeometry();

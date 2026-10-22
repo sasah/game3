@@ -23,16 +23,22 @@ export function makeRippleTexture(N = 128, seed = 11) {
   const sx = new Float32Array(N * N), sz = new Float32Array(N * N), hh = new Float32Array(N * N);
   const TAU = Math.PI * 2;
   let s2 = 0, hmax = 1e-6;
+  // Separable phases: cos/sin(a + b) from per-column and per-row tables (no trig in the loop).
+  const cu = new Float32Array(N), su = new Float32Array(N), cv = new Float32Array(N), sv = new Float32Array(N);
   for (const w of waves) {
-    // Precompute per-row / per-column phase rotations to keep this fast.
+    for (let k = 0; k < N; k++) {
+      const a = TAU * w.m * k / N + w.p, b = TAU * w.n * k / N;
+      cu[k] = Math.cos(a); su[k] = Math.sin(a); cv[k] = Math.cos(b); sv[k] = Math.sin(b);
+    }
+    const am = w.a * TAU * w.m, an = w.a * TAU * w.n;
     for (let y = 0; y < N; y++) {
+      const cy = cv[y], sy = sv[y], row = y * N;
       for (let x = 0; x < N; x++) {
-        const ph = TAU * (w.m * x + w.n * y) / N + w.p;
-        const c = Math.cos(ph), s = Math.sin(ph);
-        const i = y * N + x;
+        const c = cu[x] * cy - su[x] * sy, s = su[x] * cy + cu[x] * sy;
+        const i = row + x;
         hh[i] += w.a * s;
-        sx[i] += w.a * TAU * w.m * c;
-        sz[i] += w.a * TAU * w.n * c;
+        sx[i] += am * c;
+        sz[i] += an * c;
       }
     }
   }
@@ -59,45 +65,47 @@ export function makeRippleTexture(N = 128, seed = 11) {
   return tex;
 }
 
-// Periodic value noise (period P lattice cells) for seamless tiles.
-function phash(ix, iy, P, seed) {
-  ix = ((ix % P) + P) % P; iy = ((iy % P) + P) % P;
-  let h = Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(seed, 2246822519);
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-}
-function pnoise(x, y, P, seed) {
-  const ix = Math.floor(x), iy = Math.floor(y);
-  const fx = x - ix, fy = y - iy;
-  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
-  const a = phash(ix, iy, P, seed), b = phash(ix + 1, iy, P, seed);
-  const c = phash(ix, iy + 1, P, seed), d = phash(ix + 1, iy + 1, P, seed);
-  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
-}
-function pfbm(u, v, base, oct, seed) {
-  let s = 0, amp = 0.5, norm = 0, P = base;
-  for (let o = 0; o < oct; o++) {
-    s += amp * pnoise(u * P, v * P, P, seed + o * 31);
-    norm += amp; amp *= 0.5; P *= 2;
-  }
-  return s / norm;
-}
-
-// Tileable fbm noise: R soft (4 cells), G medium (8 cells), B very soft (2 cells), A fine (16 cells).
-export function makeNoiseTexture(N = 128) {
-  const data = new Uint8Array(N * N * 4);
-  const cfg = [[4, 4, 3], [8, 4, 7], [2, 3, 13], [16, 3, 19]];
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const u = x / N, v = y / N;
-      for (let c = 0; c < 4; c++) {
-        const [base, oct, seed] = cfg[c];
-        let n = pfbm(u, v, base, oct, seed);
-        n = Math.max(0, Math.min(1, (n - 0.5) * 1.6 + 0.5)); // stretch contrast
-        data[(y * N + x) * 4 + c] = Math.round(n * 255);
-      }
+// Tileable fbm noise from periodic value-noise lattices: R soft (4 cells), G medium (8 cells),
+// B very soft (2 cells), A fine (16 cells).
+function lattice(P, seed) {
+  const L = new Float32Array(P * P);
+  for (let j = 0; j < P; j++) {
+    for (let i = 0; i < P; i++) {
+      let h = Math.imul(i, 374761393) + Math.imul(j, 668265263) + Math.imul(seed, 2246822519);
+      h = Math.imul(h ^ (h >>> 13), 1274126177);
+      L[j * P + i] = ((h ^ (h >>> 16)) >>> 0) / 4294967296;
     }
   }
+  return L;
+}
+
+export function makeNoiseTexture(N = 128) {
+  const data = new Uint8Array(N * N * 4);
+  const acc = new Float32Array(N * N);
+  const cfg = [[4, 4, 3], [8, 4, 7], [2, 3, 13], [16, 3, 19]];
+  cfg.forEach(([base, oct, seed], c) => {
+    acc.fill(0);
+    let amp = 0.5, norm = 0, P = base;
+    for (let o = 0; o < oct; o++) {
+      const L = lattice(P, seed + o * 31);
+      const k = P / N;
+      for (let y = 0; y < N; y++) {
+        const gy = y * k, iy = Math.floor(gy), fy = gy - iy, uy = fy * fy * (3 - 2 * fy);
+        const r0 = (iy % P) * P, r1 = ((iy + 1) % P) * P;
+        for (let x = 0; x < N; x++) {
+          const gx = x * k, ix = Math.floor(gx), fx = gx - ix, ux = fx * fx * (3 - 2 * fx);
+          const i0 = ix % P, i1 = (ix + 1) % P;
+          const a = L[r0 + i0], b = L[r0 + i1], cc = L[r1 + i0], d = L[r1 + i1];
+          acc[y * N + x] += amp * (a + (b - a) * ux + (cc - a) * uy + (a - b - cc + d) * ux * uy);
+        }
+      }
+      norm += amp; amp *= 0.5; P *= 2;
+    }
+    for (let i = 0; i < N * N; i++) {
+      const n = Math.max(0, Math.min(1, (acc[i] / norm - 0.5) * 1.6 + 0.5)); // stretch contrast
+      data[i * 4 + c] = Math.round(n * 255);
+    }
+  });
   const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat, THREE.UnsignedByteType);
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.magFilter = THREE.LinearFilter;
@@ -145,7 +153,9 @@ export function bakeGround(ctx, region) {
       const x = gx0 + i * step, z = gz0 + j * step;
       const h = read(i, j);
       const d = world.pondDist(x, z);
-      let m = 1 - smoothstep(0.82, 1.7, d);
+      // Thickest along the reedy shores and in the hollows, thinner over open water so the
+      // mirror of the hut stays readable.
+      let m = (0.4 + 0.6 * smoothstep(0.5, 0.95, d)) * (1 - smoothstep(1.15, 1.75, d));
       m *= 1 - smoothstep(0.7, 2.0, h);
       m *= 0.5 + 0.5 * (0.5 + 0.5 * fbm2(x * 0.07 + 11.3, z * 0.07 - 4.1, 3));
       // Fade to nothing at the region border (texture clamps to its edge).

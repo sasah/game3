@@ -5,6 +5,7 @@
 // Nothing is animated on the CPU; per frame the CPU only moves two vec2 uniforms per patch.
 import * as THREE from 'three';
 import { GLSL_VEG_COMMON, GLSL_PATCH_PARS, GLSL_TRANSLUCENT, GLSL_NORMAL_SOFTEN } from './vegetation-grass-glsl.js';
+import { grassTuftTexture } from './vegetation-grass-tuftex.js';
 
 const lin = (hex) => new THREE.Color(hex);
 
@@ -85,6 +86,15 @@ function seedTemplate(stemQ, headQ) {
   return g;
 }
 
+// Camera-facing tuft card: one quad, x = side (-1..1), y = t (0..1).
+function cardTemplate() {
+  const pos = [-1, 0, 0, 1, 0, 0, -1, 1, 0, 1, 1, 0], idx = [0, 1, 2, 1, 3, 2];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  return g;
+}
+
 function jitterGrid(tile, density, rng) {
   const n = Math.max(1, Math.round(tile * Math.sqrt(density)));
   const c = tile / n;
@@ -102,12 +112,12 @@ function jitterGrid(tile, density, rng) {
 // ---------- shader bodies (replace <beginnormal_vertex>; must define objectNormal and vegPos) ----------
 
 const GRASS_PARS = /* glsl */ `
-uniform vec3 uGrassRoot, uGrassTipA, uGrassTipB, uGrassSilver, uGrassDry, uGrassWet;
+uniform vec3 uGrassRoot, uGrassTipA, uGrassTipB, uGrassSilver, uGrassDry, uGrassWet, uGrassFar;
 varying vec3 vVegCol;
 varying float vVegTrans;
 `;
 
-const GRASS_MAIN = /* glsl */ `
+const GRASS_MAIN = () => /* glsl */ `
   // ---- tuft (per instance) ----
   vec2 gp = vegWrap();
   float gd = distance( gp, uCam );
@@ -121,14 +131,16 @@ const GRASS_MAIN = /* glsl */ `
   if ( hash12( gp * 1.731 + 0.37 ) > dens * keep * uDensity ) VEG_CULL
   float tall = gm.g;
   float Ht = mix( 0.62, 1.25, clump ) * mix( 0.75, 1.15, clumpS ) * mix( 0.42, 1.9, tall );
-  Ht *= 1.0 - 0.55 * smoothstep( uFade.z - 6.0, uFade.w, gd );
+  float farK = smoothstep( uFade.z - 7.0, uFade.w, gd );
+  Ht *= 1.0 - 0.6 * farK;
   float gy = vegTerrain( gp );
   if ( vegOffscreen( vec3( gp.x, gy + 0.25 * Ht, gp.y ), 0.55 * Ht + 0.3 ) ) VEG_CULL
   float gust;
   float wind = vegWind( gp, gust );
   float patchC = vnoise( gp * 0.11 + 7.0 ) * 0.5 + 0.5;
   float patchC2 = vnoise( gp * 0.43 - 3.0 ) * 0.5 + 0.5;
-
+  vec3 vegPos, objectNormal;
+  vVegSpec = 1.0;
   // ---- blade ----
   float bi = position.z;
   vec2 bs = gp + vec2( bi * 0.1371, bi * 0.2913 );
@@ -160,9 +172,9 @@ const GRASS_MAIN = /* glsl */ `
   wax = vec2( wax.x * cos( tw ) - wax.y * sin( tw ), wax.x * sin( tw ) + wax.y * cos( tw ) );
   float wid = W * ( 1.0 - t * t * t ) * ( 1.0 - 0.25 * t );
   vec3 wv = vec3( wax.x, 0.0, wax.y );
-  vec3 vegPos = vec3( root.x, gy - 0.035, root.y ) + vec3( bdir.x * fw, up, bdir.y * fw ) + wv * ( s * wid * 0.5 );
+  vegPos = vec3( root.x, gy - 0.035, root.y ) + vec3( bdir.x * fw, up, bdir.y * fw ) + wv * ( s * wid * 0.5 );
   vec3 tang = vec3( bdir.x * sa, ca, bdir.y * sa );
-  vec3 objectNormal = normalize( cross( wv, tang ) );
+  objectNormal = normalize( cross( wv, tang ) );
   objectNormal = normalize( objectNormal + wv * ( s * 0.55 ) );
 
   vec3 cRoot = uGrassRoot * mix( 0.8, 1.2, r2.z );
@@ -175,8 +187,63 @@ const GRASS_MAIN = /* glsl */ `
   vec3 col = mix( cRoot, cTip, smoothstep( 0.0, 0.9, t ) );
   col *= mix( 0.38, 1.0, smoothstep( 0.0, 0.7, t ) );
   col *= 1.0 + gust * 0.3 * t;
+  // Far blades sink into the ground colour so the patch edge never reads as a carpet border.
+  col = mix( col, uGrassFar * mix( 0.7, 1.0, t ), farK * 0.75 );
   vVegCol = col;
-  vVegTrans = t * mix( 0.55, 1.0, r1.z );
+  vVegTrans = mix( 0.25, 1.0, t ) * mix( 0.6, 1.0, r1.z );
+  vVegUp = 0.62 * t * sqrt( t );
+`;
+
+const CARD_PARS = /* glsl */ `
+uniform vec3 uGrassRoot;
+varying vec3 vVegCol;
+varying float vVegTrans;
+varying vec2 vTuftCell;
+varying vec2 vTuftLocal;
+`;
+
+const CARD_MAIN = () => /* glsl */ `
+  vec2 gp = vegWrap();
+  float gd = distance( gp, uCam );
+  float gj = gd + ( hash12( gp * 4.71 + 1.3 ) - 0.5 ) * FADE_JITTER;
+  float keep = smoothstep( uFade.x, uFade.y, gj ) * ( 1.0 - smoothstep( uFade.z, uFade.w, gj ) );
+  if ( keep <= 0.0 ) VEG_CULL
+  vec4 gm = vegMask( gp );
+  float clump = vnoise( gp * 0.29 + 4.0 ) * 0.5 + 0.5;
+  float clumpS = vnoise( gp * 1.9 - 2.0 ) * 0.5 + 0.5;
+  float dens = gm.r * mix( 0.62, 1.0, smoothstep( 0.15, 0.7, clump ) ) * mix( 0.8, 1.0, clumpS );
+  float ramp = mix( 0.75, 1.0, smoothstep( uFade.y, uFade.y + 7.0, gd ) );
+  if ( hash12( gp * 1.731 + 0.37 ) > dens * keep * uDensity * ramp ) VEG_CULL
+  float tall = gm.g;
+  vec4 r1 = vec4( hash12( gp * 2.117 + 5.13 ), hash12( gp * 0.913 + 11.7 ), hash12( gp * 3.31 + 2.9 ), hash12( gp * 1.37 + 0.2 ) );
+  float H = mix( 0.3, 0.52, r1.x ) * mix( 0.62, 1.25, clump ) * mix( 0.75, 1.15, clumpS ) * mix( 0.42, 1.85, tall );
+  H = clamp( H, 0.1, 0.8 );
+  float farK = smoothstep( uFade.z - 7.0, uFade.w, gd );
+  H *= 1.0 - 0.5 * farK;
+  float W = H * mix( 1.0, 1.5, r1.y );
+  float gy = vegTerrain( gp );
+  vec3 gbase = vec3( gp.x, gy - 0.05, gp.y );
+  if ( vegOffscreen( gbase + vec3( 0.0, H * 0.5, 0.0 ), max( H, W ) * 0.7 + 0.3 ) ) VEG_CULL
+  float gust;
+  float wind = vegWind( gp, gust );
+  vec3 vegPos, objectNormal;
+  vVegSpec = 1.0;
+  vec3 toCam = cameraPosition - gbase;
+  vec3 side = normalize( vec3( toCam.z, 0.0, -toCam.x ) + 1e-5 );
+  float t = position.y;
+  vec2 shear = uWindDir * ( wind * 0.3 + sin( uTime * ( 1.6 + r1.w ) + r1.w * 6.28 ) * 0.05 ) * H * t;
+  vegPos = gbase + side * ( position.x * W * 0.5 ) + vec3( shear.x, H * t * ( 1.0 - 0.12 * dot( shear, shear ) / ( H * H + 1e-3 ) ), shear.y );
+  vec3 fwd = normalize( vec3( toCam.x, 0.0, toCam.z ) + 1e-5 );
+  objectNormal = normalize( fwd * 0.28 + vec3( 0.0, 0.6, 0.0 ) + side * ( position.x * 0.6 ) );
+  float vi = floor( r1.z * 3.999 );
+  vTuftCell = vec2( mod( vi, 2.0 ), floor( vi * 0.5 ) ) * 0.5;
+  vTuftLocal = vec2( r1.w > 0.5 ? position.x * 0.5 + 0.5 : 0.5 - position.x * 0.5, t );
+  float patchC = vnoise( gp * 0.11 + 7.0 ) * 0.5 + 0.5;
+  vec3 tint = mix( vec3( 0.86, 0.96, 0.92 ), vec3( 1.06, 1.0, 0.84 ), patchC ) * mix( 0.68, 1.1, r1.x );
+  tint = mix( tint, vec3( 0.78, 0.92, 0.98 ), gm.a * 0.45 );
+  vVegCol = tint * ( 1.0 + gust * 0.25 * t ) * mix( 1.0, 0.5, farK * 0.85 );
+  vVegTrans = 0.55 + 0.45 * t;
+  vVegUp = 0.1;
 `;
 
 const FLOWER_PARS = /* glsl */ `
@@ -194,20 +261,20 @@ const FLOWER_MAIN = /* glsl */ `
   float keep = 1.0 - smoothstep( uFade.z, uFade.w, gj );
   vec4 gm = vegMask( gp );
   float drift = smoothstep( 0.1, 0.7, vnoise( gp * 0.6 + 2.0 ) * 0.5 + 0.5 );
-  if ( r1.x > gm.b * keep * uDensity * mix( 0.35, 1.0, drift ) ) VEG_CULL
+  if ( r1.x > gm.b * keep * uDensity * mix( 0.45, 1.0, drift ) ) VEG_CULL
   float type = r1.y;
   float H, R, cup;
   vec3 petal, centre;
   if ( type < 0.48 ) {        // chamomile / ox-eye daisy
-    H = mix( 0.2, 0.46, r1.z ); R = mix( 0.017, 0.027, r1.w ); cup = 0.12; petal = uDaisy; centre = uDaisyC;
+    H = mix( 0.24, 0.5, r1.z ); R = mix( 0.02, 0.032, r1.w ); cup = 0.12; petal = uDaisy; centre = uDaisyC;
   } else if ( type < 0.7 ) {  // buttercup
-    H = mix( 0.24, 0.5, r1.z ); R = mix( 0.011, 0.016, r1.w ); cup = 0.55; petal = uButter; centre = uButter * 0.8;
+    H = mix( 0.26, 0.55, r1.z ); R = mix( 0.013, 0.019, r1.w ); cup = 0.55; petal = uButter; centre = uButter * 0.8;
   } else if ( type < 0.88 ) { // forget-me-not / bugle, pale blue
-    H = mix( 0.12, 0.3, r1.z ); R = mix( 0.009, 0.014, r1.w ); cup = 0.15; petal = uBlue; centre = uDaisyC * 0.9;
+    H = mix( 0.14, 0.34, r1.z ); R = mix( 0.011, 0.017, r1.w ); cup = 0.15; petal = uBlue; centre = uDaisyC * 0.9;
   } else {                    // white clover, low ball
     H = mix( 0.06, 0.15, r1.z ); R = mix( 0.011, 0.015, r1.w ); cup = -1.2; petal = uClover; centre = uClover;
   }
-  H *= 1.0 + gm.g * 0.7;
+  H *= 1.0 + gm.g * 0.85;
   float gy = vegTerrain( gp );
   vec3 gbase = vec3( gp.x, gy - 0.02, gp.y );
   if ( vegOffscreen( gbase + vec3( 0.0, H * 0.5, 0.0 ), H * 0.6 + 0.2 ) ) VEG_CULL
@@ -224,6 +291,7 @@ const FLOWER_MAIN = /* glsl */ `
   vec2 bdir = bendV / max( bl, 1e-4 );
 
   vec3 vegPos, objectNormal;
+  vVegSpec = 1.0;
   if ( aPart < 0.5 ) {
     float t = position.y;
     float a = phi * t, sa = sin( a ), ca = cos( a );
@@ -234,7 +302,9 @@ const FLOWER_MAIN = /* glsl */ `
     objectNormal = normalize( cross( side, tang ) + side * position.x * 0.6 );
     vVegCol = uStem * mix( 0.3, 1.0, t );
     vVegTrans = 0.3;
+    vVegUp = 0.0;
   } else {
+    vVegUp = 0.0;
     float sa = sin( phi ), ca = cos( phi );
     vec3 top = gbase + vec3( bdir.x * H * ( 1.0 - ca ) / phi, H * sa / phi, bdir.y * H * ( 1.0 - ca ) / phi );
     vec3 tang = vec3( bdir.x * sa, ca, bdir.y * sa );
@@ -311,9 +381,40 @@ const SEED_MAIN = /* glsl */ `
   }
   vec3 vegPos = p + side * ( position.x * w );
   objectNormal = normalize( cross( side, tang ) + side * position.x * 0.7 );
+  vVegUp = aPart < 0.5 ? 0.0 : 0.2;
+  vVegSpec = 1.0;
 `;
 
 // ---------- material / mesh ----------
+
+const GLSL_CARD_FRAG_PARS = /* glsl */ `
+#ifdef VEG_CARD
+uniform sampler2D tTuft;
+varying vec2 vTuftCell;
+varying vec2 vTuftLocal;
+#endif
+`;
+// Alpha-tested tuft (alpha-to-coverage on MSAA targets), alpha boosted in lower mips so distant
+// grass keeps its mass instead of dissolving.
+const GLSL_CARD_FRAG = /* glsl */ `
+#ifdef VEG_CARD
+  if ( vVegSpec > 0.5 ) {
+    vec2 tuv = vTuftCell + ( clamp( vTuftLocal, vec2( 0.01 ), vec2( 0.99 ) ) * 0.5 );
+    vec4 tc = texture2D( tTuft, tuv );
+    vec2 ts = tuv * vec2( textureSize( tTuft, 0 ) );
+    float lod = max( 0.0, 0.5 * log2( max( dot( dFdx( ts ), dFdx( ts ) ), dot( dFdy( ts ), dFdy( ts ) ) ) ) );
+    float ta = tc.a * ( 1.0 + lod * 0.3 );
+    #ifdef VEG_A2C
+      ta = clamp( ( ta - 0.5 ) / max( fwidth( ta ), 1e-4 ) + 0.5, 0.0, 1.0 );
+      if ( ta < 0.02 ) discard;
+      diffuseColor.a = ta;
+    #else
+      if ( ta < 0.5 ) discard;
+    #endif
+    diffuseColor.rgb *= tc.rgb;
+  }
+#endif
+`;
 
 function makePatch(ctx, fields, o) {
   const { world } = ctx;
@@ -326,7 +427,7 @@ function makePatch(ctx, fields, o) {
   geo.instanceCount = grid.count;
 
   const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: o.roughness, metalness: 0, side: THREE.DoubleSide });
-  mat.defines = Object.assign({ VEG_SOFTEN: '0.26', VEG_SPEC: '0.28', GRASS_WSCALE: '1.0', TUFT_R: '0.05', FADE_JITTER: '1.0' }, o.defines || {});
+  mat.defines = Object.assign({ VEG_SOFTEN: '0.26', VEG_SPEC: '0.4', VEG_SPEC_BACK: '3.0', VEG_F90: '0.35', GRASS_WSCALE: '1.0', TUFT_R: '0.05', FADE_JITTER: '1.0' }, o.defines || {});
   const center = { value: new THREE.Vector2() };
   const uniforms = Object.assign({
     uTime: ctx.uniforms.uTime,
@@ -344,18 +445,30 @@ function makePatch(ctx, fields, o) {
     tVegM: { value: fields.maskTex },
     uVegM: { value: fields.maskInfo },
     uTransCol: { value: o.trans },
+    tTuft: { value: o.texture || null },
   }, o.uniforms);
+  if (o.a2c) { mat.alphaToCoverage = true; mat.defines.VEG_A2C = ''; }
+  mat.userData.tex = o.texture || null;
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', `#include <common>\n${GLSL_VEG_COMMON}\n${GLSL_PATCH_PARS}\n${o.pars}`)
+      .replace('#include <common>', `#include <common>\n${GLSL_VEG_COMMON}\n${GLSL_PATCH_PARS}\nvarying float vVegUp;\nvarying float vVegSpec;\n${o.pars}`)
       .replace('#include <beginnormal_vertex>', o.main)
       .replace('#include <begin_vertex>', 'vec3 transformed = vegPos;');
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vVegCol;')
-      .replace('#include <color_fragment>', '#include <color_fragment>\n\tdiffuseColor.rgb *= vVegCol;')
+      .replace('#include <common>', '#include <common>\nvarying vec3 vVegCol;\nvarying float vVegUp;\nvarying float vVegSpec;\n' + GLSL_CARD_FRAG_PARS)
+      .replace('#include <color_fragment>', '#include <color_fragment>\n\tdiffuseColor.rgb *= vVegCol;\n' + GLSL_CARD_FRAG)
       .replace('#include <normal_fragment_begin>', GLSL_NORMAL_SOFTEN)
-      .replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\n\tmaterial.specularColor *= VEG_SPEC;')
+      .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
+  {
+    // Dew/wax sheen: strong when looking toward the moon, weak with the moon behind the viewer.
+    float vegBack = 0.0;
+    #if NUM_DIR_LIGHTS > 0
+      vegBack = smoothstep( 0.2, 0.85, dot( -normalize( vViewPosition ), directionalLights[ 0 ].direction ) );
+    #endif
+    material.specularColor *= mix( VEG_SPEC, VEG_SPEC_BACK, vegBack ) * vVegSpec;
+    material.specularF90 = mix( VEG_F90, 1.0, vegBack ) * vVegSpec;
+  }`)
       .replace('#include <lights_physical_pars_fragment>', `#include <lights_physical_pars_fragment>\n${GLSL_TRANSLUCENT}`);
   };
   mat.customProgramCacheKey = () => 'veg-patch-' + o.kind;
@@ -401,39 +514,41 @@ export function buildPatches(ctx, fields) {
   const cam = { value: new THREE.Vector2(ctx.camera.position.x, ctx.camera.position.z) };
 
   const grassU = {
-    uGrassRoot: { value: lin('#1f301b') },
-    uGrassTipA: { value: lin('#4f6c3a') },
-    uGrassTipB: { value: lin('#627a42') },
-    uGrassSilver: { value: lin('#7f978a') },
+    uGrassRoot: { value: lin('#213219') },
+    uGrassTipA: { value: lin('#55723a') },
+    uGrassTipB: { value: lin('#6a7f40') },
+    uGrassSilver: { value: lin('#869b84') },
+    uGrassFar: { value: lin('#2f4a28') },
     uGrassDry: { value: lin('#8f8a68') },
     uGrassWet: { value: lin('#3f5f52') },
   };
-  const trans = lin('#c8e0a0');
+  const trans = lin('#d6eab0');
 
   // Near: dense tufts of curved 7-triangle blades. Mid: sparser tufts of wide 3-triangle blades.
   const close = makePatch(ctx, fields, {
     name: 'close', kind: 'grass', seed: 101, cam,
     template: tuftTemplate(4, 2),
-    tile: low ? 7.0 : 8.6, density: low ? 44 : 64,
-    fade: low ? [-9, -8, 2.6, 3.4] : [-9, -8, 3.6, 4.6], keep: 1,
-    roughness: 0.8, trans, pars: GRASS_PARS, main: GRASS_MAIN, uniforms: grassU,
+    tile: low ? 6.6 : 7.6, density: low ? 52 : 88,
+    fade: low ? [-9, -8, 2.4, 3.1] : [-9, -8, 3.2, 4.0], keep: 1,
+    roughness: 0.8, trans, pars: GRASS_PARS, main: GRASS_MAIN(), uniforms: grassU,
     defines: { FADE_JITTER: '0.8' },
   });
   const near = makePatch(ctx, fields, {
     name: 'near', kind: 'grass', seed: 151, cam,
     template: tuftTemplate(low ? 3 : 4, 2),
-    tile: low ? 10.6 : 13.6, density: low ? 24 : 28,
-    fade: low ? [2.6, 3.4, 4.6, 5.7] : [3.6, 4.6, 6.0, 7.6],
-    roughness: 0.8, trans, pars: GRASS_PARS, main: GRASS_MAIN, uniforms: grassU,
-    defines: { FADE_JITTER: '0.8' },
+    tile: low ? 8.8 : 10.6, density: low ? 30 : 48,
+    fade: low ? [2.4, 3.1, 4.0, 5.0] : [3.2, 4.0, 5.0, 6.0],
+    roughness: 0.8, trans, pars: GRASS_PARS, main: GRASS_MAIN(), uniforms: grassU,
+    defines: { FADE_JITTER: '0.8', GRASS_WSCALE: '1.3' },
   });
   const mid = makePatch(ctx, fields, {
-    name: 'mid', kind: 'grass-mid', seed: 202, cam,
-    template: tuftTemplate(2, 1),
-    tile: low ? 32.5 : 41.5, density: low ? 5.5 : 8,
-    fade: low ? [4.6, 5.7, 15.0, 19.2] : [6.0, 7.6, 19.5, 24.5],
-    roughness: 0.75, trans, pars: GRASS_PARS, main: GRASS_MAIN, uniforms: grassU,
-    defines: { GRASS_WSCALE: '2.7', TUFT_R: '0.12', FADE_JITTER: '1.5' },
+    name: 'mid', kind: 'grass-card', seed: 202, cam,
+    template: cardTemplate(),
+    tile: low ? 32.5 : 41.5, density: low ? 6.5 : 10,
+    fade: low ? [4.0, 5.0, 13.5, 19.2] : [5.0, 6.0, 17.0, 24.5],
+    roughness: 0.8, trans, pars: CARD_PARS, main: CARD_MAIN(),
+    texture: grassTuftTexture(ctx.renderer, ctx.rng(5151), low ? 256 : 512), a2c: !low,
+    uniforms: grassU, defines: { VEG_CARD: '', VEG_SOFTEN: '0.2', FADE_JITTER: '1.5', VEG_SPEC_BACK: '0.7' },
   });
   const flowers = makePatch(ctx, fields, {
     name: 'flowers', kind: 'flowers', seed: 303, cam,

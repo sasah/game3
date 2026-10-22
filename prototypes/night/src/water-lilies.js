@@ -88,7 +88,7 @@ export function scheduleRings(ctx, ground, ringUniforms) {
       // A second, smaller ring from the same fish.
       s.again = false;
       s.v.set(s.v.x, s.v.y, t, s.v.w * 0.6);
-      s.next = t + 4 + s.rnd() * 9;
+      s.next = t + 8 + s.rnd() * 12;
       return;
     }
     for (let k = 0; k < 40; k++) {
@@ -97,7 +97,7 @@ export function scheduleRings(ctx, ground, ringUniforms) {
       if (Math.abs(x - pier.x) < 1.5 && z > pier.z1 - 1) continue;
       s.v.set(x, z, t, 0.6 + s.rnd() * 0.6);
       s.again = s.rnd() < 0.3;
-      s.next = t + (s.again ? 0.8 : 4 + s.rnd() * 9);
+      s.next = t + (s.again ? 0.8 : 8 + s.rnd() * 12);
       return;
     }
     s.next = t + 2;

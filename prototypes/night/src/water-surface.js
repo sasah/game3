@@ -2,6 +2,7 @@
 // mirrored camera (layer 0 only, reduced resolution), wind-driven procedural ripples, fresnel
 // over a dark absorbing water body, a moon glitter path and soft depth-faded shoreline.
 import * as THREE from 'three';
+import { GLSL_NOISE } from './noise.js';
 
 const vertexShader = /* glsl */ `
   #include <common>
@@ -34,6 +35,7 @@ const fragmentShader = /* glsl */ `
   #include <shadowmask_pars_fragment>
 
   uniform sampler2D tRefl;
+  uniform sampler2D tReflDepth;
   uniform sampler2D tRipple;
   uniform sampler2D tNoise;
   uniform sampler2D tGround;
@@ -52,6 +54,25 @@ const fragmentShader = /* glsl */ `
   varying vec4 vRefl;
   varying vec3 vWorld;
   varying vec2 vProj;
+
+  ${GLSL_NOISE}
+
+  // Same lattice as the sky's bright star layer, so the pond mirrors the actual stars.
+  float starRefl( vec3 d ) {
+    vec3 a = abs( d );
+    vec2 uv; float face;
+    if ( a.x >= a.y && a.x >= a.z ) { uv = d.yz / a.x; face = d.x > 0.0 ? 0.0 : 1.0; }
+    else if ( a.y >= a.z ) { uv = d.xz / a.y; face = d.y > 0.0 ? 2.0 : 3.0; }
+    else { uv = d.xy / a.z; face = d.z > 0.0 ? 4.0 : 5.0; }
+    vec2 g = uv * 140.0;
+    vec2 seed = floor( g ) + face * 131.7;
+    float pick = hash12( seed );
+    if ( pick > 0.16 ) return 0.0;
+    vec2 pos = vec2( hash12( seed + 3.1 ), hash12( seed + 7.7 ) ) * 0.7 + 0.15;
+    float mag = pow( hash12( seed + 11.3 ), 6.0 );
+    float dist = length( fract( g ) - pos );
+    return smoothstep( 0.16, 0.0, dist ) * ( 0.1 + 3.0 * mag );
+  }
 
   vec2 rippleLayer( vec2 q, float tile, float ang, float drift, vec2 off ) {
     float c = cos( ang ), s = sin( ang );
@@ -81,16 +102,18 @@ const fragmentShader = /* glsl */ `
     float wind = clamp( ( uWindStrength - 0.4 ) / 1.6, 0.0, 1.0 );
     float g1 = texture2D( tNoise, q * vec2( 0.026, 0.04 ) + vec2( - uFlow.x * 0.026, 0.13 ) ).r;
     float g2 = texture2D( tNoise, q * 0.071 + vec2( - uFlow.x * 0.09, uTime * 0.004 ) ).g;
-    float gust = smoothstep( 0.6 - 0.08 * wind, 0.86, g1 * 0.65 + g2 * 0.35 );
+    float gust = smoothstep( 0.68 - 0.1 * wind, 0.92, g1 * 0.65 + g2 * 0.35 );
     float shelter = smoothstep( 0.05, 0.8, depth );
-    float rough = ( 0.045 + gust * ( 0.3 + 0.7 * wind ) ) * shelter;
+    float rough = ( 0.04 + gust * ( 0.25 + 0.6 * wind ) ) * shelter;
 
     // Ripple slopes, wind space. The big layer is always there: slow swell that bends reflections.
     float fine = 1.0 - smoothstep( 6.0, 30.0, dist );
     vec2 sl = rippleLayer( q, 9.0, 0.0, uFlow.y, vec2( 0.0 ) ) * ( 0.0045 + 0.004 * wind );
     sl += rippleLayer( q, 2.6, 0.42, uFlow.z, vec2( 0.31, 0.17 ) ) * 0.026 * rough;
     sl += rippleLayer( q, 0.93, -0.55, uFlow.w, vec2( 0.73, 0.41 ) ) * 0.022 * rough;
+    #ifndef WATER_LOW
     sl += rippleLayer( q, 0.41, 1.2, uFlow.w * 1.3, vec2( 0.11, 0.87 ) ) * 0.016 * rough * fine;
+    #endif
     vec2 slope = sl.x * wd + sl.y * wp;
 
     // Rings from rising fish.
@@ -104,7 +127,7 @@ const fragmentShader = /* glsl */ `
         float w = 0.035 + 0.05 * age;
         float env = exp( - x * x / w ) * exp( - age * 0.6 ) * Rg.w * smoothstep( 0.0, 0.15, age );
         float k = 26.0 / ( 1.0 + 0.25 * age );
-        slope += ( dv / r ) * ( - sin( k * x ) * env * 0.09 );
+        slope += ( dv / r ) * ( - sin( k * x ) * env * 0.16 );
       }
     }
     slope *= edge;
@@ -123,7 +146,16 @@ const fragmentShader = /* glsl */ `
     vec2 uv = vRefl.xy / vRefl.w;
     vec2 off = vec2( dot( slope, perp ) * sinA * vProj.x, dot( slope, fwd ) * cosA * vProj.y );
     uv += off * uDistort;
-    vec3 refl = texture2D( tRefl, clamp( uv, vec2( 0.002 ), vec2( 0.998 ) ) ).rgb;
+    vec2 uvc = clamp( uv, vec2( 0.002 ), vec2( 0.998 ) );
+    vec3 refl = texture2D( tRefl, uvc ).rgb;
+    // Stars caught in the still water where the mirror shows open sky (depth cleared = 1).
+    vec3 Rd = reflect( - V, N );
+    #ifndef WATER_LOW
+    if ( Rd.y > 0.03 && texture2D( tReflDepth, uvc ).r > 0.99999 ) {
+      float st = starRefl( Rd ) * smoothstep( 0.03, 0.3, Rd.y ) * ( 1.0 - smoothstep( 0.85, 0.995, dot( Rd, uMoonDir ) ) );
+      refl += vec3( 0.75, 0.82, 1.0 ) * st * 0.3;
+    }
+    #endif
 
     // Moon glitter: Beckmann lobe on the rippled normal; sub-pixel roughness grows with distance
     // (ripples lost to filtering) so the far path stays a broad shimmering band.
@@ -137,10 +169,19 @@ const fragmentShader = /* glsl */ `
     float Fh = 0.02 + 0.98 * pow( 1.0 - VdH, 5.0 );
     vec3 glitter = uMoonColor * ( Fh * D / ( 4.0 * NdV ) ) * step( 0.0, dot( N, L ) );
     // Sparkle: concentrate the unresolved glitter into twinkling glints (mean stays ~1).
-    float tw = texture2D( tNoise, q * vec2( 2.9, 1.3 ) + vec2( - uFlow.w * 2.9, 0.0 ) ).a
-             * texture2D( tNoise, q * vec2( 2.1, 0.9 ) + vec2( uTime * 0.05, - uFlow.z * 0.9 ) ).a;
+    float tw = texture2D( tNoise, q * vec2( 2.9, 1.3 ) + vec2( - uFlow.w * 2.9, 0.0 ) ).a;
+    #ifdef WATER_LOW
+    tw *= 0.72;
+    #else
+    tw *= texture2D( tNoise, q * vec2( 2.1, 0.9 ) + vec2( uTime * 0.05, - uFlow.z * 0.9 ) ).a;
+    #endif
     float sparkle = mix( 1.0, 0.25 + 6.0 * smoothstep( 0.22, 0.5, tw ), fine * 0.85 );
     glitter *= sparkle;
+    // Broad silver sheen under the glints (Kuindzhi's luminous path), no sparkle.
+    float mb = 0.14 + 0.08 * rough;
+    float mb2 = mb * mb;
+    float Db = exp( ( c2 - 1.0 ) / ( mb2 * c2 ) ) / ( 3.14159 * mb2 * c2 * c2 );
+    glitter += uMoonColor * ( 0.35 * Fh * Db / ( 4.0 * NdV ) );
     float gl = dot( glitter, vec3( 0.3333 ) );
     if ( gl > 0.002 ) glitter *= getShadowMask();
 
@@ -158,14 +199,14 @@ const fragmentShader = /* glsl */ `
       gl_FragColor = vec4( vec3( F ), 1.0 );
     #elif WATER_DEBUG == 3
       gl_FragColor = vec4( glitter, 1.0 );
-    #elif WATER_DEBUG == 5
-      gl_FragColor = vec4( texture2D( tRefl, gl_FragCoord.xy / vec2( 960.0, 540.0 ) ).rgb, 1.0 );
     #elif WATER_DEBUG == 6
       gl_FragColor = vec4( rough, gust, length( slope ) * 20.0, 1.0 );
     #elif WATER_DEBUG == 4
       gl_FragColor = vec4( N * 0.5 + 0.5, 1.0 ) * 0.3;
     #endif
     #include <fog_fragment>
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
     gl_FragColor.rgb *= gl_FragColor.a;
   }`;
 
@@ -209,7 +250,9 @@ export function buildSurface(ctx, maps, ripples, noise) {
   // Reflection target: linear HDR so the moon keeps its punch for bloom.
   const reflScale = Number(params.get('reflScale')) || (quality === 'high' ? 0.5 : 0.3);
   const maxW = quality === 'high' ? 1280 : 512;
-  const rt = new THREE.WebGLRenderTarget(16, 16, { type: THREE.HalfFloatType, samples: 0, depthBuffer: true });
+  const maxPix = quality === 'high' ? 1280 * 720 : 512 * 288; // portrait phones too
+  const depthTex = new THREE.DepthTexture(16, 16);
+  const rt = new THREE.WebGLRenderTarget(16, 16, { type: THREE.HalfFloatType, samples: 0, depthBuffer: true, depthTexture: depthTex });
   rt.texture.generateMipmaps = false;
   rt.texture.minFilter = THREE.LinearFilter;
   rt.texture.magFilter = THREE.LinearFilter;
@@ -218,6 +261,7 @@ export function buildSurface(ctx, maps, ripples, noise) {
   const uniforms = THREE.UniformsUtils.merge([THREE.UniformsLib.lights, THREE.UniformsLib.fog]);
   Object.assign(uniforms, {
     tRefl: { value: rt.texture },
+    tReflDepth: { value: depthTex },
     tRipple: { value: ripples },
     tNoise: { value: noise },
     tGround: { value: ground.tex },
@@ -237,7 +281,7 @@ export function buildSurface(ctx, maps, ripples, noise) {
   });
   const mat = new THREE.ShaderMaterial({
     name: 'PondWater',
-    defines: { WATER_DEBUG: Number(params.get('wdebug') || 0) },
+    defines: Object.assign({ WATER_DEBUG: Number(params.get('wdebug') || 0) }, quality === 'low' ? { WATER_LOW: 1 } : {}),
     uniforms,
     vertexShader,
     fragmentShader,
@@ -276,6 +320,7 @@ export function buildSurface(ctx, maps, ripples, noise) {
     let w = Math.max(64, Math.round(bufSize.x * reflScale));
     let h = Math.max(36, Math.round(bufSize.y * reflScale));
     if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
+    if (w * h > maxPix) { const k = Math.sqrt(maxPix / (w * h)); w = Math.round(w * k); h = Math.round(h * k); }
     if (rt.width !== w || rt.height !== h) rt.setSize(w, h);
 
     camPos.setFromMatrixPosition(cam.matrixWorld);

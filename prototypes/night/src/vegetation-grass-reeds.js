@@ -5,6 +5,16 @@
 import * as THREE from 'three';
 import { fbm2, smoothstep, clamp, mix } from './noise.js';
 import { GLSL_VEG_COMMON, GLSL_TRANSLUCENT } from './vegetation-grass-glsl.js';
+import { reedCardTexture } from './vegetation-grass-reedtex.js';
+
+// Alpha of the leaf cards, boosted in lower mips so beds keep their mass at a distance.
+const GLSL_CARD_ALPHA = /* glsl */ `
+float reedCardAlpha( float a, vec2 uv ) {
+  vec2 ts = uv * vec2( textureSize( tReedCard, 0 ) );
+  float lod = max( 0.0, 0.5 * log2( max( dot( dFdx( ts ), dFdx( ts ) ), dot( dFdy( ts ), dFdy( ts ) ) ) ) );
+  return a * ( 1.0 + lod * 0.28 );
+}
+`;
 
 function segDist(px, pz, ax, az, bx, bz) {
   const vx = bx - ax, vz = bz - az;
@@ -14,10 +24,11 @@ function segDist(px, pz, ax, az, bx, bz) {
 
 class GeoBuilder {
   constructor() {
-    this.pos = []; this.nrm = []; this.col = []; this.root = []; this.wind = []; this.bill = []; this.idx = [];
+    this.pos = []; this.nrm = []; this.col = []; this.root = []; this.wind = []; this.bill = []; this.uv = []; this.idx = [];
   }
   get count() { return this.pos.length / 3; }
-  vert(p, n, c, root, wind, bill) {
+  vert(p, n, c, root, wind, bill, u = -1, v = -1) {
+    this.uv.push(u, v);
     this.pos.push(p.x, p.y, p.z);
     this.nrm.push(n.x, n.y, n.z);
     this.col.push(c.r, c.g, c.b);
@@ -34,6 +45,7 @@ class GeoBuilder {
     g.setAttribute('aRoot', new THREE.Float32BufferAttribute(this.root, 3));
     g.setAttribute('aWind', new THREE.Float32BufferAttribute(this.wind, 4));
     g.setAttribute('aBill', new THREE.Float32BufferAttribute(this.bill, 1));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
     g.setIndex(this.idx);
     g.computeBoundingSphere();
     return g;
@@ -100,6 +112,35 @@ function leaf(B, base, az, lean, bend, len, width, twist, segs, colA, colB, root
       prevL = l;
     }
     p.addScaledVector(_t, ds);
+  }
+}
+
+
+// Alpha-tested card painted with dozens of leaves (the mass of a reed bed). Normals point out of
+// the clump and up (same on both faces), so a card shades like a rounded bush, not a flat plane.
+const _o = new THREE.Vector3();
+function card(B, cx, cz, baseY, ang, width, height, variant, mirror, tint, root, phase) {
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  const rows = 3;
+  const H = root[2];
+  let prev = -1;
+  for (let r = 0; r <= rows; r++) {
+    const t = r / rows;
+    const y = baseY + height * t;
+    const k = Math.pow(clamp((y - baseY) / H, 0, 1.2), 1.5);
+    const wnd = [k, phase, 0.4, 0.88];
+    _c.copy(tint).multiplyScalar(mix(0.5, 1, smoothstep(0, 0.45, t)));
+    const l = B.count;
+    for (let sgn = -1; sgn <= 1; sgn += 2) {
+      const w = width * 0.5 * (1 + 0.08 * t);
+      _p.set(cx + ca * w * sgn, y, cz + sa * w * sgn);
+      _o.set(ca * sgn * 0.8, 0.12 + 0.22 * t, sa * sgn * 0.8).normalize();
+      let u = sgn < 0 ? 0 : 1;
+      if (mirror) u = 1 - u;
+      B.vert(_p, _o, _c, root, wnd, -2, variant * 0.5 + u * 0.5, t * 0.995);
+    }
+    if (prev >= 0) B.idx.push(prev, prev + 1, l, prev + 1, l + 1, l);
+    prev = l;
   }
 }
 
@@ -203,7 +244,7 @@ export function buildReeds(ctx, fields) {
   };
   const reed = {
     fresh: C('#3b4c30'), freshTip: C('#5c6a3e'),
-    dry: C('#57513f'), dryTip: C('#6f6753'),
+    dry: C('#4a4537'), dryTip: C('#5f5848'),
     plume: C('#6a6358'), plumeTip: C('#857d6f'),
   };
   const pts = [], wid = [], cols = [];
@@ -216,9 +257,20 @@ export function buildReeds(ctx, fields) {
     const root = [cl.x, cl.z, Hs + depth];
     const isCattail = rng() < (cl.td < 0.95 ? 0.8 : 0.6);
     const spread = R(0.15, 0.38);
+    // Dense mass: 2-3 crossed leaf cards per clump (cheap), geometric leaves in front of them.
+    if (cl.along > 0.3 || rng() < 0.5) {
+      const nc = cl.along > 0.7 && rng() < 0.6 ? 3 : 2;
+      const a0 = rng() * Math.PI;
+      const tint = new THREE.Color(1, 1, 1).multiplyScalar(R(0.75, 1.1));
+      for (let k = 0; k < nc; k++) {
+        card(B, cl.x + R(-0.1, 0.1), cl.z + R(-0.1, 0.1), baseY, a0 + (k * Math.PI) / nc + R(-0.2, 0.2),
+          (spread * 2 + R(0.35, 0.8)) * (isCattail ? 1 : 0.85), (Hs + depth) * R(0.6, 1.0) * (isCattail ? 1 : 0.85) * (k === 0 ? 1 : R(0.7, 1.05)),
+          rng() < 0.55 ? 0 : 1, rng() < 0.5, tint, root, rng() * 6.28);
+      }
+    }
 
     if (isCattail) {
-      const nLeaves = Math.round(R(low ? 6 : 9, low ? 10 : 16) * (0.65 + 0.35 * cl.along));
+      const nLeaves = Math.round(R(low ? 3 : 6, low ? 6 : 11) * (0.65 + 0.35 * cl.along));
       const palette = Math.floor(rng() * 3);
       for (let i = 0; i < nLeaves; i++) {
         const r = spread * Math.sqrt(rng()), a = rng() * Math.PI * 2;
@@ -266,11 +318,11 @@ export function buildReeds(ctx, fields) {
       // Phragmites: tall stems with leaves along them; last year's stalks are pale with plumes.
       const nStems = Math.round(R(2, low ? 3 : 4.5));
       for (let s = 0; s < nStems; s++) {
-        const dry = rng() < 0.42;
+        const dry = rng() < 0.28;
         const a = rng() * Math.PI * 2, r = spread * Math.sqrt(rng());
         const bx = cl.x + Math.cos(a) * r, bz = cl.z + Math.sin(a) * r;
         const top = (Hs + depth) * R(0.8, 1.08);
-        const lean = R(0.04, 0.3), laz = a + R(-0.5, 0.5);
+        const lean = R(0.06, 0.36), laz = a + R(-0.5, 0.5);
         const at = (y) => new THREE.Vector3(bx + Math.cos(laz) * lean * y * y / top, baseY + y, bz + Math.sin(laz) * lean * y * y / top);
         const ph = rng() * 6.28;
         const cA = dry ? reed.dry : reed.fresh, cB = dry ? reed.dryTip : reed.freshTip;
@@ -310,7 +362,7 @@ export function buildReeds(ctx, fields) {
         }
       }
       // a few basal leaves
-      const nb = Math.round(R(3, low ? 4 : 7));
+      const nb = Math.round(R(2, low ? 3 : 5));
       for (let i = 0; i < nb; i++) {
         const a = rng() * Math.PI * 2, r = spread * Math.sqrt(rng());
         const base = new THREE.Vector3(cl.x + Math.cos(a) * r, baseY, cl.z + Math.sin(a) * r);
@@ -324,6 +376,7 @@ export function buildReeds(ctx, fields) {
   const geo = B.geometry();
 
   const uniforms = {
+    tReedCard: { value: reedCardTexture(ctx.renderer, ctx.rng(4242), low ? 256 : 512) },
     uTime: ctx.uniforms.uTime,
     uWindStrength: ctx.uniforms.uWindStrength,
     uWindDir: ctx.uniforms.uWindDir,
@@ -336,6 +389,8 @@ attribute vec4 aWind;
 attribute float aBill;
 varying float vVegTrans;
 varying float vReedRough;
+varying vec2 vReedUv;
+varying float vReedCard; // constant per card (MSAA may extrapolate uv outside thin triangles)
 void reedDeform( inout vec3 p, inout vec3 n ) {
   float gust;
   float w = vegWind( aRoot.xy, gust );
@@ -348,7 +403,7 @@ void reedDeform( inout vec3 p, inout vec3 n ) {
   vec2 d = ( uWindDir * sway + perp * flick * Hh ) * k;
   p.xz += d;
   p.y -= dot( d, d ) / ( 2.0 * max( Hh * pow( max( k, 0.0 ), 0.667 ), 0.25 ) );
-  if ( aBill != 0.0 ) {
+  if ( aBill != 0.0 && aBill > -1.0 ) {
     vec3 axis = normalize( n );
     vec3 side = normalize( cross( axis, cameraPosition - p ) );
     p += side * aBill;
@@ -358,33 +413,55 @@ void reedDeform( inout vec3 p, inout vec3 n ) {
 `;
   const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0, side: THREE.DoubleSide });
   mat.defines = { VEG_SOFTEN: '0.12' };
+  if (!low && !ctx.params.has('noa2c')) { mat.defines.REED_A2C = ''; mat.alphaToCoverage = true; }
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${PARS}`)
-      .replace('#include <beginnormal_vertex>', 'vec3 rPos = position;\nvec3 objectNormal = normal;\nreedDeform( rPos, objectNormal );\nvVegTrans = aWind.z;\nvReedRough = aWind.w;')
+      .replace('#include <beginnormal_vertex>', 'vec3 rPos = position;\nvec3 objectNormal = normal;\nreedDeform( rPos, objectNormal );\nvVegTrans = aWind.z;\nvReedRough = aWind.w;\nvReedUv = uv;\nvReedCard = aBill < -1.0 ? 1.0 : 0.0;')
       .replace('#include <begin_vertex>', 'vec3 transformed = rPos;');
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying float vReedRough;')
+      .replace('#include <common>', `#include <common>\nvarying float vReedRough;\nvarying vec2 vReedUv;\nvarying float vReedCard;\nuniform sampler2D tReedCard;\n${GLSL_CARD_ALPHA}`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+  if ( vReedCard > 0.5 ) {
+    vec2 cuv = clamp( vReedUv, vec2( 0.001 ), vec2( 0.999 ) );
+    vec4 rc = texture2D( tReedCard, cuv );
+    float ra = reedCardAlpha( rc.a, cuv );
+    #ifdef REED_A2C
+      ra = clamp( ( ra - 0.5 ) / max( fwidth( ra ), 1e-4 ) + 0.5, 0.0, 1.0 );
+      if ( ra < 0.02 ) discard;
+      diffuseColor.a = ra;
+    #else
+      if ( ra < 0.5 ) discard;
+    #endif
+    diffuseColor.rgb *= rc.rgb;
+  }`)
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = vReedRough;')
+      .replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\n\tmaterial.specularColor *= vReedCard > 0.5 ? 0.25 : 0.7;')
       .replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
+  if ( vReedCard > 0.5 ) normal = normalize( vNormal );
   { vec3 vegUp = normalize( ( viewMatrix * vec4( 0.0, 1.0, 0.0, 0.0 ) ).xyz ); normal = normalize( mix( normal, vegUp, VEG_SOFTEN ) ); }`)
       .replace('#include <lights_physical_pars_fragment>', `#include <lights_physical_pars_fragment>\n${GLSL_TRANSLUCENT}`);
   };
   mat.customProgramCacheKey = () => 'veg-reeds';
+  mat.userData.tex = uniforms.tReedCard.value;
 
   const depth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, side: THREE.DoubleSide });
   depth.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${PARS}`)
-      .replace('#include <begin_vertex>', 'vec3 transformed = position;\nvec3 rN = normal;\nreedDeform( transformed, rN );');
+      .replace('#include <begin_vertex>', 'vec3 transformed = position;\nvec3 rN = normal;\nreedDeform( transformed, rN );\nvReedUv = uv;\nvReedCard = aBill < -1.0 ? 1.0 : 0.0;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\nvarying vec2 vReedUv;\nvarying float vReedCard;\nuniform sampler2D tReedCard;\n${GLSL_CARD_ALPHA}`)
+      .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+  if ( vReedCard > 0.5 && reedCardAlpha( texture2D( tReedCard, clamp( vReedUv, vec2( 0.001 ), vec2( 0.999 ) ) ).a, vReedUv ) < 0.5 ) discard;`);
   };
   depth.customProgramCacheKey = () => 'veg-reeds-depth';
 
   const mesh = new THREE.Mesh(geo, mat);
   mesh.name = 'reeds';
-  mesh.castShadow = true;
+  mesh.castShadow = !ctx.params.has('reednoshadow');
   mesh.receiveShadow = true;
   mesh.customDepthMaterial = depth;
   // Sway can push vertices a little outside the rest-pose bounds.
