@@ -1,0 +1,31 @@
+{
+  "about": "Style test for the Gogol detective visual novel: the same two subjects (a location and a character sprite) in four candidate styles. Generate with: python3 tools/gen-image.py --batch docs/art/style-test.json --out prototypes/styles/img",
+  "rules": "Historical accuracy: Poltava region of Left-Bank Ukraine (Little Russia), around 1811. Whitewashed clay-walled mazanka huts with thick thatched hip roofs and small windows, wattle fences with clay jugs upside down on the stakes, cherry orchards, Lombardy poplars, willows. NO sunflower fields, NO Russian log izbas, NO onion domes, NO modern objects, NO fantasy armour. No text, no letters, no captions, no signature, no watermark, no frame or border.",
+  "styles": {
+    "engraving": "A 19th-century book illustration made as a fine steel engraving / wood engraving, like the illustrated editions of Gogol from the 1840s-1870s (in the manner of Alexander Agin and Pyotr Boklevsky): delicate cross-hatching and stippling, rich tonal depth from line alone, warm sepia-black ink on slightly aged cream paper. Atmospheric and literary, slightly humorous in the characters, not a cartoon.",
+    "kuindzhi": "A luminous academic oil painting in the manner of Arkhip Kuindzhi's 'Ukrainian Night' (1876) and 'Moonlit Night on the Dnieper' (1880): deep blue-green night palette, moonlit white walls that glow almost magically, dramatic contrast of light and deep shadow, soft visible brushwork, painterly and atmospheric, museum quality.",
+    "lubok": "A hand-coloured Ukrainian / East Slavic folk print (lubok) of the early 19th century: bold black woodcut outlines, flat areas of brick red, ochre, green and indigo watercolour applied by hand slightly outside the lines, naive perspective, decorative folk ornament (Petrykivka-like flowers) in the margins of the scene, charming and witty, but the night mood still readable.",
+    "watercolor": "A soft storybook watercolour illustration with a fine sepia ink line: transparent washes, granulating pigment, paper texture, restrained muted night palette of indigo, teal and grey-green with a few warm candle accents, gentle and magical like a classic illustrated fairy-tale book, lots of air and mist."
+  },
+  "subjects": {
+    "hut": {
+      "size": "1536x1024",
+      "prompt": "A quiet moonlit May night in a Ukrainian Cossack village, as in Gogol's 'May Night, or the Drowned Maiden'. On a low hill above a still pond stands a whitewashed mazanka hut with a thick shaggy thatched hip roof, a white chimney and two small windows glowing warm with candlelight; a wattle fence with clay jugs on the stakes; an orchard of cherry trees in full white blossom around it; tall slender Lombardy poplars behind the hut against a starry blue-green sky; old willows leaning over the water; a full moon low in the sky; thin silver mist lying on the pond, which mirrors the white hut and the poplars. A narrow wooden plank walkway goes out into the water in the foreground among reeds. No people. Wide landscape composition with room for dialogue text at the bottom."
+    },
+    "golova": {
+      "size": "1024x1536",
+      "transparent": true,
+      "prompt": "Full-length character sprite on a plain transparent background: Yevtukh Makogonenko, the village head (holova) from Gogol's 'May Night', a stocky widower of about fifty-five who is blind in one eye (the blind eye half-closed and milky, the other eye sharp and sly), long grey drooping Cossack moustache, weathered face, a short clay pipe (lyulka) in his hand; he wears a plain long coat (svytka) of black homespun cloth belted with a coloured woollen sash, wide dark trousers tucked into worn leather boots, a tall sheepskin hat. Standing three-quarter view, self-important and suspicious, slightly comic. Neutral even lighting, the whole figure visible from head to boots, nothing cut off, no ground shadow, no scenery."
+    }
+  },
+  "images": [
+    { "id": "hut-engraving", "subject": "hut", "style": "engraving" },
+    { "id": "hut-kuindzhi", "subject": "hut", "style": "kuindzhi" },
+    { "id": "hut-lubok", "subject": "hut", "style": "lubok" },
+    { "id": "hut-watercolor", "subject": "hut", "style": "watercolor" },
+    { "id": "golova-engraving", "subject": "golova", "style": "engraving" },
+    { "id": "golova-kuindzhi", "subject": "golova", "style": "kuindzhi" },
+    { "id": "golova-lubok", "subject": "golova", "style": "lubok" },
+    { "id": "golova-watercolor", "subject": "golova", "style": "watercolor" }
+  ]
+}
