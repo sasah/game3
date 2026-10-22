@@ -305,6 +305,7 @@ export function buildSurface(ctx, maps, ripples, noise) {
   const vcam = new THREE.PerspectiveCamera();
   vcam.matrixWorldAutoUpdate = false;
   vcam.layers.set(0);
+  vcam.layers.enable(world.LAYER_REFLECT_ONLY);
   const normal = new THREE.Vector3(0, 1, 0);
   const planePoint = new THREE.Vector3(0, WL, 0);
   const camPos = new THREE.Vector3(), view = new THREE.Vector3(), target = new THREE.Vector3();

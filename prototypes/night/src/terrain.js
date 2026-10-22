@@ -30,10 +30,31 @@ function detailTexture(renderer) {
   return tex;
 }
 
+const SIZE = 280, CX = 0, CZ = -12;
+
 export function buildTerrain(ctx) {
-  const { world } = ctx;
-  const SIZE = 280, SEG = ctx.quality === 'low' ? 200 : 280;
-  const CX = 0, CZ = -12;
+  const SEG = ctx.quality === 'low' ? 200 : 280;
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    map: detailTexture(ctx.renderer),
+    roughness: 0.96,
+    metalness: 0,
+  });
+  const mesh = new THREE.Mesh(terrainGeometry(ctx.world, SEG), mat);
+  mesh.receiveShadow = true;
+  mesh.name = 'terrain';
+  // The full-detail ground is for the main view; the pond reflection gets a coarse copy.
+  mesh.layers.set(ctx.world.LAYER_NO_REFLECT);
+  ctx.scene.add(mesh);
+  const coarse = new THREE.Mesh(terrainGeometry(ctx.world, Math.round(SEG / 2)), mat);
+  coarse.receiveShadow = true;
+  coarse.name = 'terrain-reflection';
+  coarse.layers.set(ctx.world.LAYER_REFLECT_ONLY);
+  ctx.scene.add(coarse);
+  return mesh;
+}
+
+function terrainGeometry(world, SEG) {
   const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
@@ -69,16 +90,5 @@ export function buildTerrain(ctx) {
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
-
-  const mat = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    map: detailTexture(ctx.renderer),
-    roughness: 0.96,
-    metalness: 0,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.receiveShadow = true;
-  mesh.name = 'terrain';
-  ctx.scene.add(mesh);
-  return mesh;
+  return geo;
 }

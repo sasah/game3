@@ -8,6 +8,8 @@ export const WATER_LEVEL = 0;
 // Objects on this layer are seen by the main camera but skipped by the water reflection
 // (fine grass, particles). Use obj.layers.set(LAYER_NO_REFLECT).
 export const LAYER_NO_REFLECT = 2;
+// Seen only by the water reflection (cheaper stand-ins for expensive main-view geometry).
+export const LAYER_REFLECT_ONLY = 3;
 
 // Direction toward the moon: low in the south, a little to the east (about 17° high).
 export const MOON_DIR = new THREE.Vector3(0.35, 0.32, 1.0).normalize();
