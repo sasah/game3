@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Yard blockout</title>
+  <style>html, body { margin: 0; background: #111; } canvas { display: block; max-width: 100%; height: auto; }</style>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+  </script>
+</head>
+<body>
+  <script type="module">
+    import { render } from './src/blockout.js';
+    window.__export = render();
+  </script>
+</body>
+</html>
