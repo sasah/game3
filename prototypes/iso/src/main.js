@@ -3,15 +3,21 @@
 import * as THREE from 'three';
 import * as S from './scene.js';
 import { DIALOGUE, CLUES } from './story.js';
+import { buildAtmosphere } from './atmosphere.js';
 
 const params = new URLSearchParams(location.search);
 const shotMode = params.has('shot');
 const $ = (id) => document.getElementById(id);
 
+// grade: exposure, gamma, shadow lift, cloud-shadow strength.
 const STYLES = {
-  kuindzhi: { name: 'Куинджи', tint: [0.86, 0.9, 1.04], candle: [1.0, 0.72, 0.42], mist: [0.4, 0.48, 0.58] },
-  engraving: { name: 'Гравюра', tint: [0.92, 0.88, 0.8], candle: [1.0, 0.86, 0.62], mist: [0.74, 0.69, 0.6] },
+  kuindzhi: {
+    name: 'Куинджи', tint: [0.95, 0.98, 1.1], candle: [1.0, 0.72, 0.42], mist: [0.46, 0.54, 0.64],
+    grade: [1.22, 0.84, 0.014, 0.3], inset: 'door', smokeSheet: '../anim-test/sheet-smoke.webp',
+  },
+  engraving: { name: 'Гравюра', tint: [0.92, 0.88, 0.8], candle: [1.0, 0.86, 0.62], mist: [0.74, 0.69, 0.6], grade: [1, 1, 0, 0.18] },
 };
+const INSETS = { door: { rect: [222, 348, 798, 732] } };
 let style = params.get('style') in STYLES ? params.get('style') : 'kuindzhi';
 
 // ---------- renderer, cameras ----------
@@ -74,6 +80,46 @@ function loadSprite(url) {
   });
 }
 
+// Splits a horizontal sprite sheet into frames that share one crop, so they stay aligned. The
+// first frame (no smoke yet) defines the body height; heightFactor scales the shared crop.
+function loadSheet(url, n) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const fw = Math.floor(img.width / n), fh = img.height;
+      const boxes = [], cans = [];
+      for (let k = 0; k < n; k++) {
+        const c = document.createElement('canvas');
+        c.width = fw; c.height = fh;
+        const g = c.getContext('2d');
+        g.drawImage(img, k * fw, 0, fw, fh, 0, 0, fw, fh);
+        const d = g.getImageData(0, 0, fw, fh).data;
+        let x0 = fw, y0 = fh, x1 = 0, y1 = 0;
+        for (let y = 0; y < fh; y += 2) for (let x = 0; x < fw; x += 2) {
+          if (d[(y * fw + x) * 4 + 3] > 24) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+        }
+        boxes.push([x0, y0, x1, y1]);
+        cans.push(c);
+      }
+      const U = boxes.reduce((a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]);
+      const w = U[2] - U[0] + 2, h = U[3] - U[1] + 2;
+      const bodyH = boxes[0][3] - boxes[0][1] + 2;
+      resolve(cans.map((c) => {
+        const o = document.createElement('canvas');
+        o.width = w; o.height = h;
+        o.getContext('2d').drawImage(c, U[0], U[1], w, h, 0, 0, w, h);
+        const t = new THREE.CanvasTexture(o);
+        t.colorSpace = THREE.NoColorSpace;
+        t.anisotropy = 4;
+        return { tex: t, aspect: w / h, canvas: o, heightFactor: h / bodyH };
+      }));
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
 // Plain silhouette used until generated sprites exist.
 function placeholderSprite(color) {
   const c = document.createElement('canvas');
@@ -93,8 +139,10 @@ function placeholderSprite(color) {
 // rippling water with moon glints, drifting mist, wind in the leaves, flickering windows, and
 // candlelight that lights surfaces by their orientation.
 const bgUniforms = {
-  uColor: { value: null }, uHidden: { value: null }, uDepth: { value: null },
+  uColor: { value: null }, uHidden: { value: null }, uDepth: { value: null }, uDepthB: { value: null },
   uNormal: { value: null }, uMask: { value: null },
+  uInset: { value: null }, uInsetHidden: { value: null }, uInsetRect: { value: new THREE.Vector4(0, 0, 0, 0) }, uInsetMix: { value: 0 },
+  uGrade: { value: new THREE.Vector4(1, 1, 0, 0) },
   uCandle: { value: 0 }, uCandlePos: { value: new THREE.Vector3() },
   uCandleTint: { value: new THREE.Vector3(1, 0.75, 0.45) }, uMistColor: { value: new THREE.Vector3(0.42, 0.5, 0.6) },
   uCamWorld: { value: base.matrixWorld.clone() },
@@ -112,11 +160,11 @@ const bgMat = new THREE.ShaderMaterial({
   depthWrite: true,
   vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
-    uniform sampler2D uColor, uHidden, uDepth, uNormal, uMask;
-    uniform float uCandle, uTime, uFade, uLive, uDebug;
+    uniform sampler2D uColor, uHidden, uDepth, uDepthB, uNormal, uMask, uInset, uInsetHidden;
+    uniform float uCandle, uTime, uFade, uLive, uDebug, uInsetMix;
     uniform vec3 uCandlePos, uCandleTint, uMistColor;
     uniform mat4 uCamWorld;
-    uniform vec4 uFrustum, uPond;
+    uniform vec4 uFrustum, uPond, uInsetRect, uGrade;
     uniform vec2 uNearFar;
     varying vec2 vUv;
 
@@ -127,13 +175,24 @@ const bgMat = new THREE.ShaderMaterial({
     }
     float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { s += a * noise(p); p = p * 2.03 + 17.1; a *= 0.5; } return s; }
 
-    void main() {
-      vec3 e = texture2D(uDepth, vUv).rgb;
-      float d = dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
+    float unpack(vec3 e) { return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0)); }
+    vec3 worldAt(float d) {
       // Reconstruct the world position of this pixel from the orthographic depth.
       float vz = uNearFar.x + d * (uNearFar.y - uNearFar.x);
       vec3 local = vec3(mix(uFrustum.x, uFrustum.y, vUv.x), mix(uFrustum.z, uFrustum.w, vUv.y), -vz);
-      vec3 world = (uCamWorld * vec4(local, 1.0)).xyz;
+      return (uCamWorld * vec4(local, 1.0)).xyz;
+    }
+
+    void main() {
+      // Depth estimated from the painting follows its silhouettes exactly but is bumpy on the
+      // ground; where the blockout says flat ground and the two agree, keep the exact plane.
+      float dP = unpack(texture2D(uDepth, vUv).rgb);
+      float dB = unpack(texture2D(uDepthB, vUv).rgb);
+      vec3 wB = worldAt(dB);
+      float metres = (uNearFar.y - uNearFar.x);
+      bool flatGround = wB.y < 0.12 && abs(dP - dB) * metres < 1.1;
+      float d = flatGround ? dB : dP;
+      vec3 world = flatGround ? wB : worldAt(dP);
       vec3 N = normalize(mat3(uCamWorld) * (texture2D(uNormal, vUv).rgb * 2.0 - 1.0));
       vec4 m = texture2D(uMask, vUv, 2.5); // blurred: the painting only roughly follows the blockout
       float t = uTime;
@@ -150,6 +209,16 @@ const bgMat = new THREE.ShaderMaterial({
 
       vec3 col = texture2D(uColor, uv).rgb;
       vec3 hid = texture2D(uHidden, uv).rgb;
+      // Sharper repainted detail of a corner of the yard, faded in when the camera zooms there.
+      vec2 iuv = (uv - uInsetRect.xy) / (uInsetRect.zw - uInsetRect.xy);
+      float inR = uInsetMix * smoothstep(0.0, 0.08, min(min(iuv.x, 1.0 - iuv.x), min(iuv.y, 1.0 - iuv.y)));
+      if (inR > 0.0) {
+        col = mix(col, texture2D(uInset, iuv).rgb, inR);
+        hid = mix(hid, texture2D(uInsetHidden, iuv).rgb, inR);
+      }
+      // Lift Kuindzhi's very deep shadows a little.
+      col = pow(max(col, 0.0), vec3(uGrade.y)) * uGrade.x + uGrade.z;
+      hid = pow(max(hid, 0.0), vec3(uGrade.y)) * uGrade.x + uGrade.z;
 
       // Moon glints twinkling on the brighter parts of the water.
       float lum = dot(col, vec3(0.3, 0.59, 0.11));
@@ -169,6 +238,14 @@ const bgMat = new THREE.ShaderMaterial({
       float nearPond = 1.0 - smoothstep(0.7, 1.6, length((world.xz - uPond.xy) / (uPond.zw * 1.8)));
       float low = 1.0 - smoothstep(0.0, 1.8, world.y);
       col = mix(col, uMistColor, (mist * nearPond * 0.42 + 0.07 * mist) * low * uLive);
+
+      // Shadows of slow clouds drifting across the moon, over ground, roofs and trees alike.
+      float cloud = smoothstep(0.42, 0.78, fbm(world.xz * 0.045 + vec2(t * 0.018, -t * 0.008)));
+      col *= 1.0 - cloud * uGrade.w * uLive;
+      // Thin cloud wisps in the far sky.
+      float sky = smoothstep(0.55, 0.75, d) * smoothstep(0.75, 0.95, vUv.y);
+      float wisp = smoothstep(0.5, 0.85, fbm(vec2(vUv.x * 3.0 + t * 0.006, vUv.y * 11.0)));
+      col = mix(col, uMistColor * 1.15, wisp * sky * 0.35 * uLive);
 
       // Candle: reveal what is hidden near it and light surfaces turned toward it.
       vec3 L = uCandlePos - world;
@@ -204,16 +281,17 @@ const actorMat = (sprite, height) => new THREE.ShaderMaterial({
   transparent: true,
   depthWrite: false,
   uniforms: {
-    uMap: { value: sprite.tex }, uFlip: { value: 0 }, uTint: { value: new THREE.Vector3(1, 1, 1) },
+    uMap: { value: sprite.tex }, uMap2: { value: sprite.tex }, uMix: { value: 0 },
+    uFlip: { value: 0 }, uTint: { value: new THREE.Vector3(1, 1, 1) },
     uGlow: { value: 0 }, uGlowTint: { value: new THREE.Vector3(1, 0.75, 0.45) }, uFade: { value: 1 },
   },
   vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
-    uniform sampler2D uMap; uniform float uFlip, uGlow, uFade; uniform vec3 uTint, uGlowTint;
+    uniform sampler2D uMap, uMap2; uniform float uFlip, uGlow, uFade, uMix; uniform vec3 uTint, uGlowTint;
     varying vec2 vUv;
     void main() {
       vec2 uv = vec2(mix(vUv.x, 1.0 - vUv.x, uFlip), vUv.y);
-      vec4 c = texture2D(uMap, uv);
+      vec4 c = mix(texture2D(uMap, uv), texture2D(uMap2, uv), uMix);
       if (c.a < 0.04) discard;
       vec3 col = c.rgb * (uTint + uGlowTint * uGlow * (0.35 + 0.65 * vUv.y));
       gl_FragColor = vec4(col * uFade, c.a);
@@ -273,9 +351,17 @@ class Actor {
   setSprite(s) {
     this.current = s;
     this.mesh.material.uniforms.uMap.value = s.tex;
-    const h = this.height * PITCH_COS;
+    this.mesh.material.uniforms.uMap2.value = s.tex;
+    this.mesh.material.uniforms.uMix.value = 0;
+    const k = s.heightFactor || 1;
+    const h = this.height * PITCH_COS * k;
     this.mesh.scale.set(h * s.aspect, h, 1);
-    this.cast.scale.set(this.height * s.aspect * 0.9, 1, this.height / Math.tan(MOON_ELEV) * 0.75);
+    this.cast.scale.set(this.height * k * s.aspect * 0.9, 1, this.height / Math.tan(MOON_ELEV) * 0.75);
+  }
+  // Looping idle gesture: [[frameIndex, holdSeconds], ...] with short crossfades.
+  setIdle(frames, seq) {
+    this.idle = frames && frames.length ? { frames, seq, t: 0, step: 0 } : null;
+    if (this.idle) this.setSprite(frames[seq[0][0]]);
   }
   face(dxScreen, dyScreen) {
     const back = dyScreen > 0.15 * Math.abs(dxScreen);
@@ -286,18 +372,34 @@ class Actor {
     this.mesh.material.uniforms.uFlip.value = flip ? 1 : 0;
   }
   update(dt) {
-    this.phase += dt * (this.moving ? 9 : 2.2);
-    const hop = this.moving ? Math.abs(Math.sin(this.phase)) * 0.09 : Math.sin(this.phase) * 0.006;
-    const sway = this.moving ? Math.sin(this.phase) * 0.05 : Math.sin(this.phase * 0.7) * 0.012;
+    // A gentle gait: a soft bob on each step and a slight lean into the walk, no puppet hops.
+    this.gait = (this.gait || 0) + ((this.moving ? 1 : 0) - (this.gait || 0)) * Math.min(1, dt * 6);
+    this.phase += dt * (this.moving ? 8.5 : 1.6);
+    const bob = Math.abs(Math.sin(this.phase)) * 0.022 * this.gait;
+    const breathe = Math.sin(this.phase * 0.9) * 0.004 * (1 - this.gait);
+    const lean = (this.facing.flip ? -1 : 1) * 0.025 * this.gait + Math.sin(this.phase) * 0.008 * this.gait;
     // Card stands at the feet, nudged toward the camera so it never sinks into the ground.
     this.mesh.position.copy(this.pos).addScaledVector(viewDir, -0.45);
-    this.mesh.position.y += hop;
+    this.mesh.position.y += bob;
     this.mesh.quaternion.copy(base.quaternion);
-    this.mesh.rotateZ(sway);
+    this.mesh.rotateZ(lean);
+    this.mesh.scale.y = this.height * PITCH_COS * (this.current.heightFactor || 1) * (1 + breathe);
     this.mesh.renderOrder = 1 + toLocal(this.pos).z * 0.001;
-    this.contact.position.set(this.pos.x, 0.03, this.pos.z);
-    this.contact.scale.x = 0.75 - hop * 1.5;
-    this.cast.position.set(this.pos.x, 0.025, this.pos.z);
+    this.contact.position.set(this.pos.x, this.pos.y + 0.03, this.pos.z);
+    this.contact.scale.x = this.contactSize || 0.75;
+    this.cast.position.set(this.pos.x, this.pos.y + 0.025, this.pos.z);
+    this.cast.visible = this.castShadow !== false;
+    if (this.idle && !this.moving) {
+      const I = this.idle, [fi, hold] = I.seq[I.step];
+      I.t += dt;
+      const fade = 0.35;
+      const next = I.seq[(I.step + 1) % I.seq.length][0];
+      const u = this.mesh.material.uniforms;
+      u.uMap.value = I.frames[fi].tex;
+      u.uMap2.value = I.frames[next].tex;
+      u.uMix.value = THREE.MathUtils.smoothstep(I.t, hold - fade, hold);
+      if (I.t >= hold) { I.t = 0; I.step = (I.step + 1) % I.seq.length; }
+    }
   }
 }
 
@@ -425,21 +527,47 @@ function mulberry(a) {
 
 // ---------- game state ----------
 const state = {
-  hero: null, holova: null, path: [], candle: false, talking: false,
-  journal: [], flags: new Set(), pending: null, camX: 0, camY: 0, viewH: 8.5,
+  hero: null, holova: null, cat: null, path: [], candle: false, talking: false,
+  journal: [], flags: new Set(), pending: null, camX: 0, camY: 0, viewH: 8.5, zoomH: 8.5, focusX: 0, focusY: 0,
 };
 const sprites = {};
-let fireflyMat;
+let fireflyMat, atmo, blockoutDepth, blockoutNormal;
+
+// Places worth a closer look: walking near them, the camera eases in.
+const POIS = [
+  { id: 'holova', at: () => state.holova.pos, r: 3.2, view: 5.6 },
+  { id: 'cat', at: () => state.cat && state.cat.pos, r: 2.4, view: 4.6 },
+  { id: 'well', at: () => new THREE.Vector3(S.WELL.x, 0.6, S.WELL.z), r: 2.6, view: 5.8 },
+  { id: 'komora', at: () => new THREE.Vector3(S.SPOTS.komoraDoor.x, 0.8, S.SPOTS.komoraDoor.z - 0.6), r: 2.6, view: 6.0 },
+  { id: 'pond', at: () => new THREE.Vector3(S.POND.x + 1.5, 0, S.POND.z - 2.6), r: 3.2, view: 6.4 },
+];
 
 async function loadStyle(name) {
   style = name;
   const st = STYLES[name];
-  const [col, hid] = await Promise.all([loadTex(`img/yard-${name}.webp`), loadTex(`img/yard-${name}-hidden.webp`)]);
+  const [col, hid, dP, nP] = await Promise.all([
+    loadTex(`img/yard-${name}.webp`), loadTex(`img/yard-${name}-hidden.webp`),
+    loadTex(`img/depth-${name}.png`, { raw: true }), loadTex(`img/normal-${name}.webp`),
+  ]);
   const fallback = col || await loadTex('img/blockout/guide.png');
   bgUniforms.uColor.value = fallback;
   bgUniforms.uHidden.value = hid || fallback;
+  // Depth and normals estimated from the painting itself, when present.
+  const usePainted = params.get('depth') !== 'blockout';
+  bgUniforms.uDepth.value = (usePainted && dP) || blockoutDepth;
+  bgUniforms.uNormal.value = (usePainted && nP) || blockoutNormal;
   bgUniforms.uCandleTint.value.set(...st.candle);
   bgUniforms.uMistColor.value.set(...st.mist);
+  bgUniforms.uGrade.value.set(...st.grade);
+  const inset = st.inset && INSETS[st.inset];
+  const [iC, iH] = inset ? await Promise.all([loadTex(`img/insets/${st.inset}-${name}.webp`), loadTex(`img/insets/${st.inset}-${name}-hidden.webp`)]) : [];
+  if (inset && iC) {
+    const [x0, y0, x1, y1] = inset.rect;
+    bgUniforms.uInset.value = iC;
+    bgUniforms.uInsetHidden.value = iH || iC;
+    bgUniforms.uInsetRect.value.set(x0 / S.IMAGE.width, 1 - y1 / S.IMAGE.height, x1 / S.IMAGE.width, 1 - y0 / S.IMAGE.height);
+    state.inset = bgUniforms.uInsetRect.value;
+  } else { state.inset = null; bgUniforms.uInsetMix.value = 0; }
   const [hf, hb, gv] = await Promise.all([
     loadSprite(`img/hero-${name}-front.webp`), loadSprite(`img/hero-${name}-back.webp`),
     loadSprite(`../styles/img/golova-${name}.webp`),
@@ -447,25 +575,61 @@ async function loadStyle(name) {
   sprites.heroFront = hf || placeholderSprite('#2b3a2e');
   sprites.heroBack = hb || sprites.heroFront;
   sprites.holova = gv || placeholderSprite('#1d1d1d');
-  for (const a of [state.hero, state.holova]) if (a) a.mesh.material.uniforms.uTint.value.set(...st.tint);
+  // Idle gestures from sprite sheets: the holova smokes his pipe, the cat dozes and washes.
+  const [smoke, catSheet, cat] = await Promise.all([
+    st.smokeSheet ? loadSheet(st.smokeSheet, 4) : null,
+    loadSheet(`img/cat-${name}-sheet.webp`, 4),
+    loadSprite(`img/cat-${name}.webp`),
+  ]);
+  sprites.holovaSmoke = smoke;
+  sprites.cat = catSheet || (cat ? [cat] : null);
+  for (const a of [state.hero, state.holova, state.cat]) if (a) a.mesh.material.uniforms.uTint.value.set(...st.tint);
   if (state.hero) {
     state.hero.sprites = { front: sprites.heroFront, back: sprites.heroBack };
     state.hero.setSprite(state.hero.facing.back ? sprites.heroBack : sprites.heroFront);
     state.holova.sprites = { front: sprites.holova, back: sprites.holova };
     state.holova.setSprite(sprites.holova);
+    setupIdles();
   }
   $('portrait').src = sprites.holova.canvas.toDataURL();
   document.body.dataset.style = name;
 }
 
+function setupIdles() {
+  state.holova.setIdle(sprites.holovaSmoke, [[0, 3.2], [1, 1.1], [2, 1.6], [3, 1.4]]);
+  if (state.cat) state.cat.setIdle(sprites.cat, [[0, 4.5], [1, 1.4], [2, 2.2], [3, 2.6]]);
+}
+
 // ---------- camera window ----------
+// Eases toward a closer view near points of interest and frames the hero and the point together.
+function updateZoom(dt, snap) {
+  let target = state.viewH, fx = 0, fy = 0, w = 0;
+  const hl = toLocal(state.hero.pos);
+  for (const p of POIS) {
+    const at = p.at();
+    if (!at) continue;
+    const d = Math.hypot(at.x - state.hero.pos.x, at.z - state.hero.pos.z);
+    const c = 1 - THREE.MathUtils.smoothstep(d, p.r * 0.55, p.r);
+    if (c <= 0) continue;
+    target = Math.min(target, THREE.MathUtils.lerp(state.viewH, p.view, c));
+    const pl = toLocal(at);
+    fx += (pl.x - hl.x) * 0.45 * c; fy += (pl.y - hl.y) * 0.45 * c; w = Math.max(w, c);
+  }
+  if (state.talking) target = Math.min(target, 5.2);
+  const k = snap || shotMode ? 1 : 1 - Math.exp(-dt * 1.4);
+  state.zoomH += (target - state.zoomH) * k;
+  state.focusX += (fx - state.focusX) * k;
+  state.focusY += (fy - state.focusY) * k;
+}
+
 function updateCamera(dt, snap = false) {
+  updateZoom(dt, snap);
   const aspect = window.innerWidth / window.innerHeight;
-  let vh = Math.min(state.viewH, FULL_H), vw = vh * aspect;
+  let vh = Math.min(state.zoomH, FULL_H), vw = vh * aspect;
   if (vw > FULL_W) { vw = FULL_W; vh = vw / aspect; }
   const l = toLocal(state.hero.pos);
-  const tx = THREE.MathUtils.clamp(l.x, base.left + vw / 2, base.right - vw / 2);
-  const ty = THREE.MathUtils.clamp(l.y + 0.8, base.bottom + vh / 2, base.top - vh / 2);
+  const tx = THREE.MathUtils.clamp(l.x + state.focusX, base.left + vw / 2, base.right - vw / 2);
+  const ty = THREE.MathUtils.clamp(l.y + 0.8 + state.focusY, base.bottom + vh / 2, base.top - vh / 2);
   const k = snap ? 1 : 1 - Math.exp(-dt * 3);
   state.camX += (tx - state.camX) * k;
   state.camY += (ty - state.camY) * k;
@@ -474,6 +638,17 @@ function updateCamera(dt, snap = false) {
   cam.updateProjectionMatrix();
   // Fireflies scale with zoom so they stay small specks.
   if (fireflyMat) fireflyMat.uniforms.uScale.value = renderer.getPixelRatio() * Math.min(1.6, window.innerHeight / vh / 60);
+  if (atmo) atmo.setPixelsPerMetre(renderer.getPixelRatio() * window.innerHeight / vh);
+  // The sharper inset fades in once the view is close and mostly inside it.
+  if (state.inset) {
+    const r = state.inset;
+    const u0 = (cam.left - base.left) / FULL_W, u1 = (cam.right - base.left) / FULL_W;
+    const v0 = (cam.bottom - base.bottom) / FULL_H, v1 = (cam.top - base.bottom) / FULL_H;
+    const ox = Math.max(0, Math.min(u1, r.z) - Math.max(u0, r.x)) / (u1 - u0);
+    const oy = Math.max(0, Math.min(v1, r.w) - Math.max(v0, r.y)) / (v1 - v0);
+    const close = 1 - THREE.MathUtils.smoothstep(vh, 6.0, 8.0);
+    bgUniforms.uInsetMix.value = close * THREE.MathUtils.smoothstep(ox * oy, 0.35, 0.75);
+  }
 }
 
 function screenToGround(cx, cy) {
@@ -487,7 +662,7 @@ function screenToGround(cx, cy) {
 
 function actorScreenRect(a) {
   const l = toLocal(a.pos);
-  const h = a.height * PITCH_COS, w = h * a.current.aspect;
+  const h = a.height * PITCH_COS * (a.current.heightFactor || 1), w = h * a.current.aspect;
   return { x0: l.x - w / 2, x1: l.x + w / 2, y0: l.y, y1: l.y + h };
 }
 
@@ -496,6 +671,13 @@ function onTap(cx, cy) {
   const rect = canvas.getBoundingClientRect();
   const lx = cam.left + ((cx - rect.left) / rect.width) * (cam.right - cam.left);
   const ly = cam.bottom + (1 - (cy - rect.top) / rect.height) * (cam.top - cam.bottom);
+  if (state.cat) {
+    const c = actorScreenRect(state.cat);
+    if (lx > c.x0 - 0.3 && lx < c.x1 + 0.3 && ly > c.y0 - 0.3 && ly < c.y1 + 0.3) {
+      walkTo(new THREE.Vector3(state.cat.pos.x + 1.0, 0, state.cat.pos.z + 1.0), () => toast(CAT_LINES[(state.catPets = (state.catPets || 0) + 1) % CAT_LINES.length]));
+      return;
+    }
+  }
   const r = actorScreenRect(state.holova);
   const pad = 0.25;
   if (lx > r.x0 - pad && lx < r.x1 + pad && ly > r.y0 - pad && ly < r.y1 + pad) {
@@ -505,6 +687,12 @@ function onTap(cx, cy) {
   walkTo(screenToGround(cx, cy));
   showMarker(cx, cy);
 }
+
+const CAT_LINES = [
+  'Кошка приоткрыла один глаз и снова зажмурилась.',
+  'Кошка мурлычет. Ей нет дела ни до русалок, ни до ревизии.',
+  'Кошка вылизывает лапу. У неё свои дела.',
+];
 
 function walkTo(target, then = null) {
   const p = findPath(state.hero.pos, target);
@@ -612,7 +800,7 @@ function frame(now) {
   if (state.path.length) {
     const target = state.path[0];
     const d = tmpV.subVectors(target, hero.pos).setY(0);
-    const dist = d.length(), step = 2.3 * dt;
+    const dist = d.length(), step = 1.9 * dt;
     if (dist <= step) {
       hero.pos.copy(target);
       state.path.shift();
@@ -630,6 +818,8 @@ function frame(now) {
   } else hero.moving = 0;
   hero.update(dt);
   state.holova.update(dt);
+  if (state.cat) state.cat.update(dt);
+  if (atmo) atmo.update(time);
   checkClues();
 
   // Candle light follows the hero, centred about his chest.
@@ -687,9 +877,13 @@ async function init() {
   const [depth, normal, mask] = await Promise.all([
     loadTex('img/blockout/depth.png', { raw: true }), loadTex('img/blockout/normal.png'), loadTex('img/blockout/mask.png'),
   ]);
+  blockoutDepth = depth;
+  blockoutNormal = normal;
   bgUniforms.uDepth.value = depth;
+  bgUniforms.uDepthB.value = depth;
   bgUniforms.uNormal.value = normal;
   bgUniforms.uMask.value = mask;
+  bgUniforms.uInset.value = bgUniforms.uInsetHidden.value = depth;
   await loadStyle(style);
   $('styleBtn').textContent = STYLES[style].name;
   const st = STYLES[style];
@@ -697,14 +891,24 @@ async function init() {
   state.hero.pos.set(S.SPOTS.heroStart.x, 0, S.SPOTS.heroStart.z);
   state.holova = new Actor('holova', { front: sprites.holova, back: sprites.holova }, 1.7);
   state.holova.pos.set(S.SPOTS.holova.x, 0, S.SPOTS.holova.z);
-  for (const a of [state.hero, state.holova]) a.mesh.material.uniforms.uTint.value.set(...st.tint);
+  if (sprites.cat) {
+    // The cat dozes on the bench by the hut wall.
+    state.cat = new Actor('cat', { front: sprites.cat[0], back: sprites.cat[0] }, 0.4);
+    state.cat.pos.set(S.BENCH.x - 0.15, 0.47, S.BENCH.z);
+    state.cat.contactSize = 0.45;
+    state.cat.castShadow = false;
+  }
+  setupIdles();
+  for (const a of [state.hero, state.holova, state.cat]) if (a) a.mesh.material.uniforms.uTint.value.set(...st.tint);
   if (params.has('hero')) {
     const [x, z] = params.get('hero').split(',').map(Number);
     state.hero.pos.set(x, 0, z);
   }
   if (params.has('candle')) { state.candle = true; bgUniforms.uCandle.value = 1; }
-  if (params.has('view')) state.viewH = Number(params.get('view'));
+  if (params.has('view')) state.viewH = state.zoomH = Number(params.get('view'));
+  if (params.has('t')) time = Number(params.get('t'));
   fireflyMat = makeFireflies();
+  atmo = buildAtmosphere({ scene, base, uniforms: bgUniforms });
   resize();
   updateCamera(0, true);
   if (shotMode) { bgUniforms.uFade.value = 1; $('intro').remove(); if (params.has('talk')) startDialogue(params.get('talk')); }
