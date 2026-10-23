@@ -9,8 +9,8 @@ const shotMode = params.has('shot');
 const $ = (id) => document.getElementById(id);
 
 const STYLES = {
-  kuindzhi: { name: 'Куинджи', tint: [0.86, 0.9, 1.04], candle: [1.0, 0.72, 0.42] },
-  engraving: { name: 'Гравюра', tint: [0.92, 0.88, 0.8], candle: [1.0, 0.86, 0.62] },
+  kuindzhi: { name: 'Куинджи', tint: [0.86, 0.9, 1.04], candle: [1.0, 0.72, 0.42], mist: [0.4, 0.48, 0.58] },
+  engraving: { name: 'Гравюра', tint: [0.92, 0.88, 0.8], candle: [1.0, 0.86, 0.62], mist: [0.74, 0.69, 0.6] },
 };
 let style = params.get('style') in STYLES ? params.get('style') : 'kuindzhi';
 
@@ -28,9 +28,6 @@ const viewDir = new THREE.Vector3(0, 0, -1).applyQuaternion(base.quaternion);
 
 function toLocal(p, out = new THREE.Vector3()) {
   return out.copy(p).applyMatrix4(base.matrixWorldInverse);
-}
-function localToImageUV(l) {
-  return new THREE.Vector2((l.x - base.left) / FULL_W, (l.y - base.bottom) / FULL_H);
 }
 
 // ---------- textures ----------
@@ -91,11 +88,21 @@ function placeholderSprite(color) {
 }
 
 // ---------- painted background with depth ----------
+// The painting is drawn as a full-frame quad that writes the blockout's depth, so 3D actors are
+// occluded per pixel. Normals and material masks from the blockout let shaders bring it to life:
+// rippling water with moon glints, drifting mist, wind in the leaves, flickering windows, and
+// candlelight that lights surfaces by their orientation.
 const bgUniforms = {
   uColor: { value: null }, uHidden: { value: null }, uDepth: { value: null },
-  uCandle: { value: 0 }, uCandleUV: { value: new THREE.Vector2(0.5, 0.5) },
-  uCandleR: { value: new THREE.Vector2(0.1, 0.15) }, uCandleTint: { value: new THREE.Vector3(1, 0.75, 0.45) },
-  uTime: { value: 0 }, uFade: { value: 0 },
+  uNormal: { value: null }, uMask: { value: null },
+  uCandle: { value: 0 }, uCandlePos: { value: new THREE.Vector3() },
+  uCandleTint: { value: new THREE.Vector3(1, 0.75, 0.45) }, uMistColor: { value: new THREE.Vector3(0.42, 0.5, 0.6) },
+  uCamWorld: { value: base.matrixWorld.clone() },
+  uFrustum: { value: new THREE.Vector4(base.left, base.right, base.bottom, base.top) },
+  uNearFar: { value: new THREE.Vector2(base.near, base.far) },
+  uPond: { value: new THREE.Vector4(S.POND.x, S.POND.z, S.POND.rx, S.POND.rz) },
+  uTime: { value: 0 }, uFade: { value: 0 }, uLive: { value: params.get('live') === '0' ? 0 : 1 },
+  uDebug: { value: Number(params.get('debug') || 0) },
 };
 const bgMat = new THREE.ShaderMaterial({
   uniforms: bgUniforms,
@@ -105,24 +112,81 @@ const bgMat = new THREE.ShaderMaterial({
   depthWrite: true,
   vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
-    uniform sampler2D uColor, uHidden, uDepth;
-    uniform float uCandle, uTime, uFade;
-    uniform vec2 uCandleUV, uCandleR;
-    uniform vec3 uCandleTint;
+    uniform sampler2D uColor, uHidden, uDepth, uNormal, uMask;
+    uniform float uCandle, uTime, uFade, uLive, uDebug;
+    uniform vec3 uCandlePos, uCandleTint, uMistColor;
+    uniform mat4 uCamWorld;
+    uniform vec4 uFrustum, uPond;
+    uniform vec2 uNearFar;
     varying vec2 vUv;
+
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+    }
+    float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { s += a * noise(p); p = p * 2.03 + 17.1; a *= 0.5; } return s; }
+
     void main() {
-      vec3 col = texture2D(uColor, vUv).rgb;
-      vec3 hid = texture2D(uHidden, vUv).rgb;
-      vec2 q = (vUv - uCandleUV) / uCandleR;
-      float flicker = 0.94 + 0.06 * sin(uTime * 13.0) * sin(uTime * 7.3 + 1.7);
-      float r = length(q) / flicker;
-      float inLight = (1.0 - smoothstep(0.55, 1.0, r)) * uCandle;
-      vec3 lit = mix(col, hid, inLight) * mix(vec3(1.0), uCandleTint * 1.6, inLight * (1.0 - r * 0.7) * 0.7);
-      // Outside the candle the night presses in.
-      lit *= mix(1.0, 0.62, uCandle * smoothstep(0.85, 1.9, r));
-      gl_FragColor = vec4(lit * uFade, 1.0);
       vec3 e = texture2D(uDepth, vUv).rgb;
-      gl_FragDepth = dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
+      float d = dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
+      // Reconstruct the world position of this pixel from the orthographic depth.
+      float vz = uNearFar.x + d * (uNearFar.y - uNearFar.x);
+      vec3 local = vec3(mix(uFrustum.x, uFrustum.y, vUv.x), mix(uFrustum.z, uFrustum.w, vUv.y), -vz);
+      vec3 world = (uCamWorld * vec4(local, 1.0)).xyz;
+      vec3 N = normalize(mat3(uCamWorld) * (texture2D(uNormal, vUv).rgb * 2.0 - 1.0));
+      vec4 m = texture2D(uMask, vUv, 2.5); // blurred: the painting only roughly follows the blockout
+      float t = uTime;
+
+      vec2 uv = vUv;
+      float water = smoothstep(0.12, 0.55, m.r) * uLive;
+      vec2 rip = vec2(sin(world.x * 2.6 + t * 1.1 + 2.0 * sin(world.z * 1.3 + t * 0.5)),
+                      cos(world.z * 2.9 - t * 0.9 + 2.0 * sin(world.x * 1.1 - t * 0.6)));
+      uv += rip * 0.0015 * water;
+      float leaf = smoothstep(0.08, 0.45, m.g) * uLive;
+      float gust = 0.6 + 0.4 * sin(t * 0.37) * sin(t * 0.23 + 1.0);
+      float sway = sin(t * 1.6 + world.x * 0.7 + world.z * 0.4) + 0.5 * sin(t * 2.9 + world.y * 1.3);
+      uv += vec2(sway, 0.35 * cos(t * 2.2 + world.x)) * 0.0010 * gust * leaf * clamp(world.y / 4.0, 0.25, 1.0);
+
+      vec3 col = texture2D(uColor, uv).rgb;
+      vec3 hid = texture2D(uHidden, uv).rgb;
+
+      // Moon glints twinkling on the brighter parts of the water.
+      float lum = dot(col, vec3(0.3, 0.59, 0.11));
+      vec2 cell = floor(world.xz * vec2(9.0, 15.0));
+      float tw = hash(cell + floor(t * 4.0 + hash(cell) * 9.0));
+      col += vec3(0.85, 0.92, 1.0) * step(0.94, tw) * water * smoothstep(0.16, 0.45, lum) * 0.6;
+
+      // Candle flicker in the painted windows: warm bright pixels near the window mask.
+      float win = smoothstep(0.01, 0.2, texture2D(uMask, vUv, 4.5).b);
+      float warm = smoothstep(0.06, 0.3, col.r - col.b) * smoothstep(0.3, 0.75, col.r);
+      float fl = 0.9 + 0.1 * sin(t * 8.3) * sin(t * 5.1 + 1.3) + 0.04 * sin(t * 23.0);
+      col *= mix(1.0, fl * 1.06, warm * win * uLive);
+
+      // Drifting ground mist, thickest over and around the pond.
+      vec2 mp = world.xz * 0.22 + vec2(t * 0.035, t * 0.012);
+      float mist = smoothstep(0.38, 0.85, fbm(mp));
+      float nearPond = 1.0 - smoothstep(0.7, 1.6, length((world.xz - uPond.xy) / (uPond.zw * 1.8)));
+      float low = 1.0 - smoothstep(0.0, 1.8, world.y);
+      col = mix(col, uMistColor, (mist * nearPond * 0.42 + 0.07 * mist) * low * uLive);
+
+      // Candle: reveal what is hidden near it and light surfaces turned toward it.
+      vec3 L = uCandlePos - world;
+      float dist = length(L);
+      float flick = 0.93 + 0.07 * sin(t * 13.0) * sin(t * 7.3 + 1.7);
+      float reveal = (1.0 - smoothstep(2.0, 3.2, dist / flick)) * uCandle;
+      col = mix(col, hid, reveal);
+      float atten = (1.0 / (1.0 + pow(dist / 1.9, 2.0))) * (1.0 - smoothstep(4.0, 6.5, dist));
+      float lam = clamp(dot(N, L / max(dist, 1e-3)), 0.0, 1.0) * 0.82 + 0.18;
+      float light = uCandle * atten * lam * flick;
+      col = col * (1.0 - uCandle * 0.38 * (1.0 - smoothstep(0.0, 0.3, atten))) + col * uCandleTint * light * 2.4;
+      // A little warm haze so the light reads even on dark grass.
+      col += uCandleTint * light * 0.07;
+
+      gl_FragColor = vec4(col * uFade, 1.0);
+      if (uDebug > 0.5) gl_FragColor = vec4(fract(world.x * 0.25), clamp(world.y / 4.0, 0.0, 1.0), fract(world.z * 0.25), 1.0);
+      if (uDebug > 1.5) gl_FragColor = vec4(vec3(light), 1.0);
+      gl_FragDepth = d;
     }`,
 });
 const bgPivot = new THREE.Object3D();
@@ -156,13 +220,29 @@ const actorMat = (sprite, height) => new THREE.ShaderMaterial({
     }`,
 });
 
-const shadowMat = new THREE.ShaderMaterial({
+// Soft contact shadow under the feet.
+const contactMat = new THREE.ShaderMaterial({
   transparent: true,
   depthWrite: false,
-  polygonOffset: true,
-  polygonOffsetFactor: -2,
   vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-  fragmentShader: `varying vec2 vUv; void main() { float d = length(vUv - 0.5) * 2.0; gl_FragColor = vec4(0.0, 0.01, 0.03, 0.55 * smoothstep(1.0, 0.2, d)); }`,
+  fragmentShader: `varying vec2 vUv; void main() { float d = length(vUv - 0.5) * 2.0; gl_FragColor = vec4(0.0, 0.01, 0.03, 0.5 * smoothstep(1.0, 0.2, d)); }`,
+});
+
+// The figure's silhouette laid on the ground, stretched away from the low moon.
+const MOON_FLAT = new THREE.Vector2(S.MOON_DIR.x, S.MOON_DIR.z).normalize();
+const MOON_ELEV = Math.asin(S.MOON_DIR.y);
+const castMat = (actor) => new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  uniforms: { uMap: actor.mesh.material.uniforms.uMap, uFlip: actor.mesh.material.uniforms.uFlip },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D uMap; uniform float uFlip; varying vec2 vUv;
+    void main() {
+      vec2 uv = vec2(mix(vUv.x, 1.0 - vUv.x, uFlip), vUv.y);
+      float a = texture2D(uMap, uv, 3.0).a;
+      gl_FragColor = vec4(0.0, 0.01, 0.04, a * 0.6 * (1.0 - vUv.y * 0.6));
+    }`,
 });
 
 class Actor {
@@ -178,10 +258,16 @@ class Actor {
     this.mesh.quaternion.copy(base.quaternion);
     this.mesh.frustumCulled = false;
     scene.add(this.mesh);
-    this.shadow = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), shadowMat);
-    this.shadow.scale.set(0.9, 1, 0.55);
-    this.shadow.renderOrder = 0.5;
-    scene.add(this.shadow);
+    this.contact = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), contactMat);
+    this.contact.scale.set(0.75, 1, 0.42);
+    this.contact.renderOrder = 0.5;
+    scene.add(this.contact);
+    // Plane lying on the ground with its "up" pointing away from the moon.
+    this.cast = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0).rotateX(-Math.PI / 2), castMat(this));
+    this.cast.rotation.y = Math.atan2(MOON_FLAT.x, MOON_FLAT.y);
+    this.cast.renderOrder = 0.4;
+    this.cast.frustumCulled = false;
+    scene.add(this.cast);
     this.setSprite(sprites.front);
   }
   setSprite(s) {
@@ -189,6 +275,7 @@ class Actor {
     this.mesh.material.uniforms.uMap.value = s.tex;
     const h = this.height * PITCH_COS;
     this.mesh.scale.set(h * s.aspect, h, 1);
+    this.cast.scale.set(this.height * s.aspect * 0.9, 1, this.height / Math.tan(MOON_ELEV) * 0.75);
   }
   face(dxScreen, dyScreen) {
     const back = dyScreen > 0.15 * Math.abs(dxScreen);
@@ -208,9 +295,9 @@ class Actor {
     this.mesh.quaternion.copy(base.quaternion);
     this.mesh.rotateZ(sway);
     this.mesh.renderOrder = 1 + toLocal(this.pos).z * 0.001;
-    // Moon shadow falls up and to the left, away from the moon.
-    this.shadow.position.set(this.pos.x - 0.25, 0.04, this.pos.z - 0.12);
-    this.shadow.scale.x = 0.9 - hop * 2;
+    this.contact.position.set(this.pos.x, 0.03, this.pos.z);
+    this.contact.scale.x = 0.75 - hop * 1.5;
+    this.cast.position.set(this.pos.x, 0.025, this.pos.z);
   }
 }
 
@@ -352,6 +439,7 @@ async function loadStyle(name) {
   bgUniforms.uColor.value = fallback;
   bgUniforms.uHidden.value = hid || fallback;
   bgUniforms.uCandleTint.value.set(...st.candle);
+  bgUniforms.uMistColor.value.set(...st.mist);
   const [hf, hb, gv] = await Promise.all([
     loadSprite(`img/hero-${name}-front.webp`), loadSprite(`img/hero-${name}-back.webp`),
     loadSprite(`../styles/img/golova-${name}.webp`),
@@ -545,10 +633,8 @@ function frame(now) {
   checkClues();
 
   // Candle light follows the hero, centred about his chest.
-  const l = toLocal(hero.pos);
-  l.y += 1.0 * PITCH_COS;
-  bgUniforms.uCandleUV.value.copy(localToImageUV(l));
-  bgUniforms.uCandleR.value.set(3.1 / FULL_W, 3.1 / FULL_H);
+  // The candle is held at chest height, a little in front of the hero.
+  bgUniforms.uCandlePos.value.set(hero.pos.x + 0.2, 1.15, hero.pos.z + 0.2);
   const target = state.candle ? 1 : 0;
   bgUniforms.uCandle.value += (target - bgUniforms.uCandle.value) * Math.min(1, dt * 4);
   const glow = bgUniforms.uCandle.value * (0.9 + 0.1 * Math.sin(time * 11));
@@ -598,8 +684,12 @@ $('styleBtn').addEventListener('click', async () => {
 
 // ---------- start ----------
 async function init() {
-  const depth = await loadTex('img/blockout/depth.png', { raw: true });
+  const [depth, normal, mask] = await Promise.all([
+    loadTex('img/blockout/depth.png', { raw: true }), loadTex('img/blockout/normal.png'), loadTex('img/blockout/mask.png'),
+  ]);
   bgUniforms.uDepth.value = depth;
+  bgUniforms.uNormal.value = normal;
+  bgUniforms.uMask.value = mask;
   await loadStyle(style);
   $('styleBtn').textContent = STYLES[style].name;
   const st = STYLES[style];

@@ -259,5 +259,33 @@ export function render() {
   scene.overrideMaterial = depthMaterial;
   depth.render(scene, cam);
   out.depth = depth.domElement.toDataURL('image/png');
+
+  // Surface normals in view space, for relighting the painting.
+  scene.overrideMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+  depth.render(scene, cam);
+  out.normal = depth.domElement.toDataURL('image/png');
+
+  // Material masks: R water, G foliage (sways in the wind), B windows (candle flicker).
+  scene.overrideMaterial = null;
+  const kinds = {
+    [new THREE.Color(C.water).getHexString()]: [1, 0, 0],
+    [new THREE.Color(C.blossom).getHexString()]: [0, 1, 0],
+    [new THREE.Color(C.poplar).getHexString()]: [0, 0.7, 0],
+    [new THREE.Color(C.willow).getHexString()]: [0, 1, 0],
+    [new THREE.Color(C.reed).getHexString()]: [0, 0.6, 0],
+    [new THREE.Color(C.window).getHexString()]: [0, 0, 1],
+  };
+  const black = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide });
+  const saved = [];
+  scene.traverse((o) => {
+    if (!o.isMesh) return;
+    saved.push([o, o.material]);
+    const k = kinds[o.material.color.getHexString()];
+    o.material = k ? new THREE.MeshBasicMaterial({ color: new THREE.Color().setRGB(...k), side: THREE.DoubleSide }) : black;
+  });
+  scene.background = new THREE.Color(0, 0, 0);
+  depth.render(scene, cam);
+  out.mask = depth.domElement.toDataURL('image/png');
+  for (const [o, m] of saved) o.material = m;
   return out;
 }
